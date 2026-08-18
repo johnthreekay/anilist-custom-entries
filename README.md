@@ -11,6 +11,6 @@ Userscript that adds **client-side custom entries** to [AniList](https://anilist
 
 - On your anime/manga list, next to the random-entry button: **+** creates an entry, **wrench** manages them (list, export/import, GitHub sync, image host).
 - <img width="218" height="591" alt="image" src="https://github.com/user-attachments/assets/f7957442-0b1f-4354-8819-73e945095095" />
-- The **+** modal searches MangaBaka, MangaDex, Dynasty Reader, RanobeDB and MAL and fills the whole form from a pick (cover, description, tags, characters); everything can also be typed by hand. Create opens the native list editor.
+- The **+** modal searches MangaBaka, MangaDex, Dynasty scans, RanobeDB and MAL and fills the whole form from a pick (cover, description, tags, characters); everything can also be typed by hand. Create opens the native list editor.
 - Custom entries have a working media page and an **Edit Custom Entry** page (AniList's submission form, applied locally).
 - Covers from hosts that block or fake hotlinks are embedded automatically, or uploaded to a self-hosted image server if you configure one.
