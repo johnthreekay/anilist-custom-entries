@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AniList Custom Entries
 // @namespace    al-custom-entries
-// @version      1.30.1
+// @version      1.32.1
 // @description  Create fully client-side custom anime/manga entries on AniList that behave like normal list entries (rate, note, custom lists, progress, favourite, delete) via the native UI, including local activity feed entries and the home page's in-progress lists. Optionally syncs the database to a private GitHub repo for cross-device use.
 // @author       john
 // @homepageURL  https://github.com/johnthreekay/anilist-custom-entries
@@ -36,7 +36,7 @@
   const window = (typeof unsafeWindow === 'object' && unsafeWindow) ? unsafeWindow : globalThis;
 
   const TAG = '[AL-Custom]';
-  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.30.1'; } catch (e) { /* diagnostics only */ }
+  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.32.1'; } catch (e) { /* diagnostics only */ }
   const ID_BASE = 2000000000; // far above any real AniList media/entry id, still within GraphQL Int32
   const LS_KEY = 'al-custom-entries-v1';
 
@@ -232,6 +232,7 @@
     for (const id of Object.keys(out.entries)) {
       bump(id);
       for (const c of out.entries[id].characters || []) bump(c.id);
+      for (const st of out.entries[id].staff || []) { bump(st.id); bump(st.staffId); }
     }
     for (const id of Object.keys(out.activities)) {
       bump(id);
@@ -799,6 +800,18 @@
       page['mediaCharacters-' + id] = { pageInfo: info, pageData: edges };
     }
 
+    // Staff links -> staff entities + page edges (overview Staff section and
+    // the Staff tab), same convention as characters above.
+    const staffEntities = {};
+    const staffLinks = rec.staff || [];
+    if (staffLinks.length) {
+      const edges = staffLinks.map((s) => ({ id: s.id, role: s.role || '', node: s.staffId }));
+      for (const s of staffLinks) staffEntities[s.staffId] = staffEntityOf(s);
+      const info = { total: edges.length, perPage: 25, currentPage: 1, lastPage: 1, hasNextPage: false };
+      page['mediaStaffPreview-' + id] = { pageInfo: info, pageData: edges };
+      page['mediaStaff-' + id] = { pageInfo: info, pageData: edges };
+    }
+
     const studioEntities = {};
     if (rec.media.studioName) {
       studioEntities[id] = { id, name: rec.media.studioName, isAnimationStudio: true, isFavourite: false };
@@ -838,6 +851,7 @@
         listEntry: recIsListed(rec) ? { [rec.entry.id]: entryEntity(rec) } : {},
         user: { [rec.ownerId]: userEntity(rec.ownerId) },
         character: characterEntities,
+        staff: staffEntities,
         studio: studioEntities,
         recommendation: recommendationEntities,
         page,
@@ -910,7 +924,12 @@
     const e = rec.entry;
     const anime = rec.type === 'ANIME';
     const now = Math.floor(Date.now() / 1000);
-    const progressed = typeof e.progress === 'number' && e.progress > (prevProgress || 0);
+    // Progress on a Completed entry is a correction, not reading/watching:
+    // no "read chapter N of X" for it. Without this, an entry created as
+    // Completed got one next to its "completed X" as soon as the native
+    // editor (or the completion auto-fill) set its progress.
+    const progressed = e.status !== 'COMPLETED'
+      && typeof e.progress === 'number' && e.progress > (prevProgress || 0);
     const progressStatus = () => (e.status === 'REPEATING'
       ? (anime ? 'rewatched episode' : 'reread chapter')
       : (anime ? 'watched episode' : 'read chapter'));
@@ -1133,6 +1152,28 @@
    * RPC handlers (respond without touching the network)
    * ------------------------------------------------------------------ */
 
+  // Mirror the AniList API's server-side behaviour on a status change:
+  // Completed on a finished series fills progress to the episode/chapter
+  // (and volume) count and stamps today's start/finish dates; starting
+  // stamps the start date. `status` undefined (not sent) is a no-op.
+  function applyStatusEffects(rec, status) {
+    const e = rec.entry;
+    const today = () => {
+      const d = new Date();
+      return { year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate() };
+    };
+    if (status === 'COMPLETED' && rec.media.status === 'FINISHED') {
+      const maxProgress = rec.type === 'ANIME' ? rec.media.episodes : rec.media.chapters;
+      if (maxProgress) e.progress = maxProgress;
+      if (rec.type === 'MANGA' && rec.media.volumes) e.progressVolumes = rec.media.volumes;
+      if (!e.completedAt || !e.completedAt.year) e.completedAt = today();
+      if (!e.startedAt || !e.startedAt.year) e.startedAt = today();
+    }
+    if (status === 'CURRENT' && (!e.startedAt || !e.startedAt.year)) {
+      e.startedAt = today();
+    }
+  }
+
   function handleSave(vars) {
     const rec = recById(vars.id) || recById(vars.mediaId);
     if (!rec) return { result: null, entities: {} };
@@ -1153,21 +1194,7 @@
       for (const name of vars.customLists) map[name] = true;
       e.customLists = map;
     }
-    // Mirror the AniList API's server-side behaviour on status changes.
-    const today = () => {
-      const d = new Date();
-      return { year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate() };
-    };
-    if (vars.status === 'COMPLETED' && rec.media.status === 'FINISHED') {
-      const maxProgress = rec.type === 'ANIME' ? rec.media.episodes : rec.media.chapters;
-      if (maxProgress) e.progress = maxProgress;
-      if (rec.type === 'MANGA' && rec.media.volumes) e.progressVolumes = rec.media.volumes;
-      if (!e.completedAt || !e.completedAt.year) e.completedAt = today();
-      if (!e.startedAt || !e.startedAt.year) e.startedAt = today();
-    }
-    if (vars.status === 'CURRENT' && (!e.startedAt || !e.startedAt.year)) {
-      e.startedAt = today();
-    }
+    applyStatusEffects(rec, vars.status);
     e.updatedAt = Math.floor(Date.now() / 1000);
     saveDB();
     recordListActivity(rec, prevStatus, prevProgress);
@@ -1211,6 +1238,14 @@
         touchRec(owner.rec);
         saveDB();
         console.log(TAG, 'toggled character favourite', id, owner.c.isFavourite);
+      } else {
+        const links = staffLinksFor(id);
+        if (links.length) {
+          const fav = !links[0].s.isFavourite;
+          for (const { rec, s: st } of links) { st.isFavourite = fav; touchRec(rec); }
+          saveDB();
+          console.log(TAG, 'toggled staff favourite', id, fav);
+        }
       }
     }
     const c = { pageInfo: { total: 0 } };
@@ -1350,14 +1385,161 @@
       modNotes: null,
       idMal: null,
       trailer: null,
-      relations: { edges: [] },
+      relations: {
+        edges: (rec.relations || []).map((rl) => {
+          const tm = recTargetMediaEntity(rl) || {};
+          const cov = tm.coverImage || {};
+          return {
+            id: rl.id,
+            relationType: rl.type,
+            media: {
+              id: rl.target,
+              title: { userPreferred: (tm.title && tm.title.userPreferred) || ('#' + rl.target) },
+              type: tm.type || rec.type,
+              format: tm.format || null,
+              startDate: { year: (tm.startDate && tm.startDate.year) || null },
+              coverImage: { medium: cov.medium || cov.large || null },
+            },
+          };
+        }),
+      },
       studios: {
         edges: md.studioName
           ? [{ id: rec.id, isMain: true, studio: { id: rec.id, name: md.studioName } }]
           : [],
       },
-      externalLinks: md.externalLinks || [],
+      externalLinks: (md.externalLinks || []).map((l) => ({
+        id: l.id, site: l.site, siteId: l.siteId, url: l.url, type: l.type || 'INFO',
+        language: l.language || null, notes: l.notes || null, isDisabled: !!l.isDisabled,
+      })),
     };
+  }
+
+  // Edit page "Add Relation" (SaveMediaRelation on Submit): one edge per
+  // target, keyed the same way as the MangaBaka-fetched ones (rec.relations
+  // = [{id, type, target, media: stub}]), so the media page's Relations
+  // section and the quick-edit panel list them alike. Custom targets get
+  // the reciprocal edge, real targets a media stub (from the store, where
+  // the picker just normalized it, else fetched).
+  function handleSaveMediaRelation(vars, ctxRec) {
+    const rec = isCustomId(vars.mediaId) ? recById(parseInt(vars.mediaId, 10)) : ctxRec;
+    const target = vars.relationId !== undefined && vars.relationId !== null ? parseInt(vars.relationId, 10) : null;
+    if (!rec || !target || target === rec.id) return { SaveMediaRelation: true };
+    rec.relations = rec.relations || [];
+    const type = String(vars.relationType || 'OTHER');
+    let edge = rec.relations.find((x) => x.target === target);
+    if (edge) {
+      edge.type = type;
+    } else {
+      db.seq += 1;
+      edge = { id: ID_BASE + db.seq, type, target, media: isCustomId(target) ? null : mediaStubFromStore(target) };
+      rec.relations.push(edge);
+      const targetRec = isCustomId(target) ? recById(target) : null;
+      if (targetRec) {
+        targetRec.relations = targetRec.relations || [];
+        if (!targetRec.relations.some((x) => x.target === rec.id)) {
+          db.seq += 1;
+          targetRec.relations.push({ id: ID_BASE + db.seq, type: INVERSE_REL[type] || 'OTHER', target: rec.id, media: null });
+          touchRec(targetRec);
+        }
+      } else if (!edge.media) {
+        fetchRelationStub(rec, edge);
+      }
+    }
+    touchRec(rec);
+    saveDB();
+    pushRecEntities(rec);
+    console.log(TAG, 'relation saved locally', rec.id, type, '->', target);
+    return { SaveMediaRelation: true };
+  }
+
+  function fetchRelationStub(rec, edge) {
+    nativeFetch.call(window, '/graphql', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: 'query($id:Int){Media(id:$id){id type format status(version:2) isAdult bannerImage title{userPreferred}coverImage{large medium}startDate{year}}}',
+        variables: { id: edge.target },
+      }),
+    }).then((r) => r.json()).then((j) => {
+      const m = j && j.data && j.data.Media;
+      if (!m) return;
+      edge.media = {
+        id: m.id, title: { userPreferred: (m.title && m.title.userPreferred) || ('#' + m.id) },
+        type: m.type || null, format: m.format || null, status: m.status || null,
+        bannerImage: m.bannerImage || null,
+        coverImage: { large: m.coverImage && m.coverImage.large, medium: m.coverImage && (m.coverImage.medium || m.coverImage.large) },
+        startDate: m.startDate || { year: null }, isAdult: !!m.isAdult,
+      };
+      touchRec(rec);
+      saveDB();
+      pushRecEntities(rec);
+    }).catch(() => {});
+  }
+
+  // Edit page "Add Link" (SaveMediaExternalLink on Submit): stored on
+  // rec.media.externalLinks in the media entity's own shape, so the media
+  // page's link sidebar renders it as-is. Colour/icon come from AniList's
+  // link-source catalog (public query) when the site is known there.
+  const linkSourceCache = new Map();
+  function handleSaveMediaExternalLink(vars, ctxRec) {
+    const rec = isCustomId(vars.mediaId) ? recById(parseInt(vars.mediaId, 10)) : ctxRec;
+    if (!rec) return { SaveMediaExternalLink: true };
+    const md = rec.media;
+    md.externalLinks = md.externalLinks || [];
+    const url = String(vars.url || '').trim();
+    const linkId = isCustomId(vars.id) ? parseInt(vars.id, 10) : null;
+    let link = linkId ? md.externalLinks.find((l) => l.id === linkId) : null;
+    if (!link) {
+      if (!url) return { SaveMediaExternalLink: true };
+      db.seq += 1;
+      link = { id: ID_BASE + db.seq, url: null, site: null, siteId: null, type: 'INFO', language: null, color: null, icon: null, notes: null, isDisabled: false };
+      md.externalLinks.push(link);
+    }
+    if (url) link.url = url;
+    if (vars.siteId !== undefined && vars.siteId !== null && vars.siteId !== '') link.siteId = parseInt(vars.siteId, 10) || null;
+    if (vars.site) link.site = String(vars.site);
+    if (vars.type) link.type = String(vars.type);
+    if (vars.language !== undefined) link.language = vars.language || null;
+    if (vars.notes !== undefined) link.notes = vars.notes || null;
+    if (vars.isDisabled !== undefined) link.isDisabled = !!vars.isDisabled;
+    if (!link.site) link.site = (() => { try { return new URL(link.url).hostname.replace(/^www\./, ''); } catch (e) { return 'Link'; } })();
+    touchRec(rec);
+    saveDB();
+    pushRecEntities(rec);
+    console.log(TAG, 'external link saved locally', rec.id, link.site, link.url);
+    if (link.siteId) enrichLinkSource(rec, link);
+    return { SaveMediaExternalLink: true };
+  }
+
+  function enrichLinkSource(rec, link) {
+    const apply = (src) => {
+      if (!src) return;
+      link.site = src.site || link.site;
+      link.type = src.type || link.type;
+      link.color = src.color || null;
+      link.icon = src.icon || null;
+      if (!link.language && src.language) link.language = src.language;
+      touchRec(rec);
+      saveDB();
+      pushRecEntities(rec);
+    };
+    if (linkSourceCache.has(link.siteId)) { apply(linkSourceCache.get(link.siteId)); return; }
+    nativeFetch.call(window, '/graphql', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: 'query($id:Int){ExternalLinkSourceCollection(id:$id){id site type language color icon}}',
+        variables: { id: link.siteId },
+      }),
+    }).then((r) => r.json()).then((j) => {
+      const list = (j && j.data && j.data.ExternalLinkSourceCollection) || [];
+      const src = list.find((x) => x.id === link.siteId) || null;
+      linkSourceCache.set(link.siteId, src);
+      apply(src);
+    }).catch(() => {});
   }
 
   // Apply a SaveMedia mutation's variables (the form's `changes`) locally.
@@ -1429,6 +1611,194 @@
 
   // Characters created via SaveCharacter before they're linked to a media.
   const pendingChars = new Map();
+
+  /* --- staff --- */
+
+  // Staff live on the record like characters: rec.staff = [link], link =
+  // { id (link id, custom), staffId (a real AniList staff id, or a custom id
+  // for staff created locally with the edit page's "Create New Staff"),
+  // role, name{first,middle,last,full,native,userPreferred}, image,
+  // language, occupations, + description/gender/… for local staff }. One
+  // person can hold several roles on an entry, so link ids are their own.
+  const DEFAULT_STAFF_IMG = 'https://s4.anilist.co/file/anilistcdn/staff/large/default.jpg';
+  const STAFF_FIELDS = ['staffId', 'isCustom', 'name', 'image', 'language', 'occupations', 'description',
+    'gender', 'homeTown', 'bloodType', 'age', 'yearsActive', 'dateOfBirth', 'dateOfDeath', 'isFavourite'];
+  const copyStaffData = (dst, src) => { for (const k of STAFF_FIELDS) if (src[k] !== undefined) dst[k] = src[k]; return dst; };
+  // Staff created via SaveStaff before being linked to a media (data objects).
+  const pendingStaff = new Map();
+
+  function staffNameOf(s) {
+    const n = s.name || {};
+    const full = n.userPreferred || n.full || [n.first, n.middle, n.last].filter(Boolean).join(' ') || 'Staff #' + s.staffId;
+    return {
+      first: n.first || null, middle: n.middle || null, last: n.last || null,
+      full: n.full || full, native: n.native || null, userPreferred: full,
+    };
+  }
+  // Media page / favourites shape (what mediaStaffPreview edges point at).
+  function staffEntityOf(s) {
+    const img = s.image || DEFAULT_STAFF_IMG;
+    return { id: s.staffId, name: { userPreferred: staffNameOf(s).userPreferred }, language: s.language || null, image: { large: img, medium: img } };
+  }
+  // Edit page shape (staffRoles edge node, SaveStaff result).
+  function staffEditShape(s) {
+    const n = staffNameOf(s);
+    return { id: s.staffId, name: { userPreferred: n.userPreferred, full: n.full, first: n.first, last: n.last }, image: { medium: s.image || DEFAULT_STAFF_IMG } };
+  }
+  function findStaffLink(linkId) {
+    for (const rec of allRecs()) {
+      const st = (rec.staff || []).find((x) => x.id === linkId);
+      if (st) return { rec, s: st };
+    }
+    return null;
+  }
+  function staffLinksFor(staffId) {
+    const out = [];
+    for (const rec of allRecs()) for (const st of rec.staff || []) if (st.staffId === staffId) out.push({ rec, s: st });
+    return out;
+  }
+  // Real staff linked from the edit page's search: fetch the display data
+  // once (name/image/language/occupations); the placeholder shows meanwhile.
+  function fetchStaffDetails(rec, s) {
+    nativeFetch.call(window, '/graphql', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: 'query($id:Int){Staff(id:$id){id name{first middle last full native userPreferred}image{large}language:languageV2 primaryOccupations}}',
+        variables: { id: s.staffId },
+      }),
+    }).then((r) => r.json()).then((j) => {
+      const st = j && j.data && j.data.Staff;
+      if (!st) return;
+      s.name = st.name;
+      s.image = (st.image && st.image.large) || null;
+      s.language = st.language || null;
+      s.occupations = st.primaryOccupations || [];
+      touchRec(rec);
+      saveDB();
+      pushRecEntities(rec);
+    }).catch(() => {});
+  }
+
+  // "Create New Staff" (and edits of a local staff): keep a data object
+  // until SaveMediaStaff links it; afterwards every link sharing the id is
+  // updated, since links are denormalized copies.
+  function handleSaveStaff(vars) {
+    const id = isCustomId(vars.id) ? parseInt(vars.id, 10) : null;
+    let st = id ? (pendingStaff.get(id) || null) : null;
+    let links = [];
+    if (!st && id) { links = staffLinksFor(id); st = links.length ? links[0].s : null; }
+    const isNew = !st;
+    if (isNew) {
+      db.seq += 1;
+      st = { staffId: ID_BASE + db.seq, isCustom: true, name: null, image: null, language: null };
+    }
+    if (vars.name) {
+      const n = vars.name;
+      const full = [n.first, n.middle, n.last].filter(Boolean).join(' ') || 'Unnamed';
+      st.name = {
+        first: n.first || null, middle: n.middle || null, last: n.last || null,
+        native: n.native || null, full, userPreferred: full,
+        alternative: Array.isArray(n.alternative) ? n.alternative : [],
+      };
+    }
+    if (typeof vars.image === 'string' && vars.image) st.image = vars.image;
+    for (const k of ['description', 'gender', 'homeTown', 'bloodType', 'age', 'yearsActive', 'dateOfBirth', 'dateOfDeath']) {
+      if (vars[k] !== undefined) st[k] = vars[k];
+    }
+    if (vars.primaryOccupations !== undefined) st.occupations = vars.primaryOccupations || [];
+    if (vars.language !== undefined) st.language = vars.language || null;
+    if (isNew) pendingStaff.set(st.staffId, st);
+    else if (links.length) {
+      for (const { rec, s: link } of links) { copyStaffData(link, st); touchRec(rec); }
+      saveDB();
+      for (const { rec } of links) pushRecEntities(rec);
+    }
+    console.log(TAG, isNew ? 'created local staff' : 'saved local staff', st.staffId, staffNameOf(st).userPreferred);
+    return { SaveStaff: staffEditShape(st) };
+  }
+
+  // Edit page Submit: one SaveMediaStaff per row (id = existing link id when
+  // editing a role, staffId = the AniList id picked in "Add Staff" or a
+  // local id from "Create New Staff").
+  function handleSaveMediaStaff(vars, ctxRec) {
+    const rec = isCustomId(vars.mediaId) ? recById(parseInt(vars.mediaId, 10)) : ctxRec;
+    if (!rec) return { SaveMediaStaff: true };
+    rec.staff = rec.staff || [];
+    const linkId = isCustomId(vars.id) ? parseInt(vars.id, 10) : null;
+    const staffId = vars.staffId !== undefined && vars.staffId !== null ? parseInt(vars.staffId, 10) : null;
+    let st = linkId ? rec.staff.find((x) => x.id === linkId) : null;
+    if (!st && staffId) {
+      db.seq += 1;
+      st = { id: ID_BASE + db.seq, staffId, role: null, name: null, image: null, language: null };
+      const src = pendingStaff.get(staffId) || (staffLinksFor(staffId)[0] || {}).s;
+      if (src) { copyStaffData(st, src); pendingStaff.delete(staffId); }
+      rec.staff.push(st);
+      if (!src && !isCustomId(staffId)) fetchStaffDetails(rec, st);
+    }
+    if (st) {
+      if (vars.role !== undefined && vars.role !== null) st.role = String(vars.role);
+      touchRec(rec);
+      saveDB();
+      pushRecEntities(rec);
+      console.log(TAG, 'linked staff to custom entry', rec.id, st.staffId, st.role);
+    }
+    return { SaveMediaStaff: true };
+  }
+
+  // Local /staff/<id> page for staff created locally: header data plus the
+  // roles on custom entries. The site keys the roles pages by its own page
+  // id (vars JSON), which arrives in the RPC options; the entity's own
+  // schema key gets the same page so either lookup works.
+  function staffPageResult(sid, vars, opts) {
+    const links = staffLinksFor(sid);
+    if (!links.length) return { result: null, entities: {} };
+    const st = links[0].s;
+    const img = st.image || DEFAULT_STAFF_IMG;
+    const noDate = { year: null, month: null, day: null };
+    const staff = {
+      id: sid,
+      name: Object.assign({ alternative: (st.name && st.name.alternative) || [] }, staffNameOf(st)),
+      image: { large: img },
+      description: st.description ? sanitizeHtml(st.description) : null,
+      favourites: 0,
+      isFavourite: !!st.isFavourite,
+      isFavouriteBlocked: false,
+      age: st.age || null,
+      gender: st.gender || null,
+      yearsActive: st.yearsActive || [],
+      homeTown: st.homeTown || null,
+      bloodType: st.bloodType || null,
+      primaryOccupations: st.occupations || [],
+      dateOfBirth: st.dateOfBirth || noDate,
+      dateOfDeath: st.dateOfDeath || noDate,
+      language: st.language || null,
+      characterMedia: 'staffCharacterMediaRoles-' + sid,
+      staffMedia: 'staffMediaRoles-' + sid,
+    };
+    const page = {};
+    const media = {};
+    const pageId = opts && opts.page && opts.page.id ? String(opts.page.id) : null;
+    const v = vars || {};
+    if (v.withStaffRoles || v.withCharacterRoles) {
+      const edges = [];
+      if (v.withStaffRoles) {
+        for (const { rec, s: link } of links) {
+          if (v.type && rec.type !== v.type) continue;
+          media[rec.id] = mediaEntity(rec);
+          edges.push({ staffRole: link.role || '', node: rec.id });
+        }
+      }
+      const pg = {
+        pageInfo: { total: edges.length, perPage: 25, currentPage: v.staffPage || v.characterPage || 1, lastPage: 1, hasNextPage: false },
+        pageData: edges,
+      };
+      page[v.withStaffRoles ? staff.staffMedia : staff.characterMedia] = pg;
+      if (pageId) page[pageId] = pg;
+    }
+    return { result: sid, entities: { staff: { [sid]: staff }, media, page } };
+  }
 
   function handleSaveCharacter(vars, ctxRec) {
     const id = isCustomId(vars.id) ? parseInt(vars.id, 10) : null;
@@ -1553,7 +1923,8 @@
         const rec = recById(parseInt(vars.id, 10));
         if (!rec) return { Media: null };
         if (query.includes('staffRoles')) {
-          return { Media: { id: rec.id, staffRoles: { pageInfo: { total: 0, perPage: 25, currentPage: 1, lastPage: 1, hasNextPage: false }, edges: [] } } };
+          const edges = (rec.staff || []).map((st) => ({ id: st.id, role: st.role || null, staff: staffEditShape(st) }));
+          return { Media: { id: rec.id, staffRoles: { pageInfo: { total: edges.length, perPage: 25, currentPage: 1, lastPage: 1, hasNextPage: false }, edges } } };
         }
         return { Media: editMediaShape(rec) };
       }
@@ -1563,6 +1934,7 @@
     }
 
     // Mutations
+    if (ctxRec) noteLocalSubmit(ctxRec); // Submit on a custom entry's edit page
     // Replies on local activities (post / edit / delete / like).
     if (query.includes('SaveActivityReply')) {
       const a = isCustomId(vars.activityId) ? activityById(vars.activityId)
@@ -1646,6 +2018,56 @@
       pendingChars.delete(parseInt(vars.id, 10));
       return { DeleteCharacter: { deleted: true } };
     }
+    // Relations / external links on the edit page.
+    if (query.includes('SaveMediaRelation(')) return handleSaveMediaRelation(vars, ctxRec);
+    if (query.includes('DeleteMediaRelation(')) {
+      const eid = parseInt(vars.id, 10);
+      for (const rec of allRecs()) {
+        const before = (rec.relations || []).length;
+        if (!before) continue;
+        rec.relations = rec.relations.filter((x) => x.id !== eid);
+        if (rec.relations.length !== before) { touchRec(rec); saveDB(); pushRecEntities(rec); console.log(TAG, 'relation removed locally', eid); }
+      }
+      return { DeleteMediaRelation: { deleted: true } };
+    }
+    if (query.includes('SaveMediaExternalLink(')) return handleSaveMediaExternalLink(vars, ctxRec);
+    if (query.includes('DeleteMediaExternalLink(')) {
+      const lid = parseInt(vars.id, 10);
+      for (const rec of allRecs()) {
+        const links = rec.media.externalLinks || [];
+        if (!links.some((l) => l.id === lid)) continue;
+        rec.media.externalLinks = links.filter((l) => l.id !== lid);
+        touchRec(rec); saveDB(); pushRecEntities(rec);
+        console.log(TAG, 'external link removed locally', lid);
+      }
+      return { DeleteMediaExternalLink: { deleted: true } };
+    }
+    // Staff on the edit page: "Add Staff" (real AniList staff), "Create New
+    // Staff" (local), role edits and the row's trash button.
+    if (query.includes('SaveMediaStaff(')) return handleSaveMediaStaff(vars, ctxRec);
+    if (query.includes('SaveStaff(') && (ctxRec || isCustomId(vars.id))) return handleSaveStaff(vars);
+    if (query.includes('DeleteMediaStaff(')) {
+      const hit = isCustomId(vars.id) ? findStaffLink(parseInt(vars.id, 10)) : null;
+      if (hit) {
+        hit.rec.staff = hit.rec.staff.filter((x) => x.id !== hit.s.id);
+        touchRec(hit.rec);
+        saveDB();
+        pushRecEntities(hit.rec);
+        console.log(TAG, 'unlinked staff', hit.s.staffId, 'from', hit.rec.id);
+      }
+      return { DeleteMediaStaff: { deleted: true } };
+    }
+    if (query.includes('DeleteStaff(') && isCustomId(vars.id)) {
+      const sid = parseInt(vars.id, 10);
+      for (const { rec } of staffLinksFor(sid)) {
+        rec.staff = rec.staff.filter((x) => x.staffId !== sid);
+        touchRec(rec);
+        pushRecEntities(rec);
+      }
+      pendingStaff.delete(sid);
+      saveDB();
+      return { DeleteStaff: { deleted: true } };
+    }
     // The sidebar "Add Tag" (+) modal: add the tag to the local record,
     // enriched from AniList's tag catalog when the name matches.
     if (query.includes('AddMediaTag') && isCustomId(vars.mediaId)) {
@@ -1687,8 +2109,8 @@
       }
       return { SaveMediaTagVote: true };
     }
-    // Anything else (staff/studio/link/relation submissions…) must never
-    // reach the server while a custom entry is in play.
+    // Anything else (studio submissions…) must never reach the server while
+    // a custom entry is in play.
     console.warn(TAG, 'blocked submission mutation for custom entry', query.slice(0, 90));
     return {};
   }
@@ -1850,7 +2272,20 @@
       ents.media[rec.id] = mediaEntity(rec);
       ids.push(rec.entry.id);
     }
-    const timeOf = (id) => (ents.listEntry[id] && ents.listEntry[id].updatedAt) || 0;
+    // Response rows carry updatedAt because onOutgoing adds it to the home
+    // query; the store copy is a fallback (e.g. an entry a list page loaded)
+    // for the odd row that still lacks it.
+    let storeEnts = null;
+    const timeOf = (id) => {
+      const e = ents.listEntry[id];
+      if (e && e.updatedAt) return e.updatedAt;
+      if (storeEnts === null) {
+        const store = vueStore();
+        storeEnts = (store && entitiesState(store)) || false;
+      }
+      const x = storeEnts && storeEnts.listEntry && storeEnts.listEntry[id];
+      return (x && x.updatedAt) || 0;
+    };
     pg.pageData = mergeByTime(ids, pg.pageData.filter((id) => !ids.includes(id)), timeOf);
     console.log(TAG, `injected ${ids.length} custom entr${ids.length === 1 ? 'y' : 'ies'} into ${meta.pageId}`);
   }
@@ -1912,6 +2347,58 @@
     }
   }
 
+  // The home preview's real rows only carry updatedAt because onOutgoing
+  // extends the site's query. When that query ran before our hooks existed
+  // (late injection, repaired by selfHeal) they have none, and custom
+  // entries could only pin on top. Fetch the timestamps ourselves (same
+  // query the site uses, id + updatedAt only, session cookie), merge them
+  // into the store (setEntities merges per entity) and re-sort the preview
+  // by time in place. Cached per type for a minute so repeated
+  // syncHomePreview calls (one per entry from selfHeal) share one request.
+  const previewTimesCache = {};
+  function fillPreviewTimes(type) {
+    const now = Date.now();
+    const c = previewTimesCache[type];
+    if (c && now - c.at < 60000) return c.promise;
+    const uid = authUserId();
+    if (!uid) return Promise.resolve();
+    const query = 'query($userId:Int,$type:MediaType,$perPage:Int){Page(perPage:$perPage){'
+      + 'mediaList(userId:$userId,type:$type,status_in:[CURRENT,REPEATING],sort:UPDATED_TIME_DESC){id updatedAt}}}';
+    const promise = nativeFetch.call(window, '/graphql', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ query, variables: { userId: uid, type, perPage: 50 } }),
+    })
+      .then((r) => r.json())
+      .then((j) => {
+        const rows = (j && j.data && j.data.Page && j.data.Page.mediaList) || [];
+        const store = vueStore();
+        const ents = store && entitiesState(store);
+        const pg = ents && ents.page && ents.page['homeListPreview-' + type];
+        const arr = pg && pg.pageData && pg.pageData[1];
+        if (!Array.isArray(arr) || !rows.length) return;
+        const patch = {};
+        for (const row of rows) {
+          if (row && row.id && row.updatedAt && arr.includes(row.id)) {
+            patch[row.id] = { id: row.id, updatedAt: row.updatedAt };
+          }
+        }
+        if (!Object.keys(patch).length) return;
+        store.commit('setEntities', { listEntry: patch });
+        const timeOf = (id) => (ents.listEntry && ents.listEntry[id] && ents.listEntry[id].updatedAt) || 0;
+        const sorted = arr.slice().sort((a, b) => timeOf(b) - timeOf(a));
+        if (sorted.some((id, i) => id !== arr[i])) arr.splice(0, arr.length, ...sorted);
+        console.log(TAG, `re-sorted homeListPreview-${type} by updatedAt (${Object.keys(patch).length} rows timed)`);
+      })
+      .catch((e) => {
+        delete previewTimesCache[type];
+        console.warn(TAG, 'preview updatedAt fetch failed', e);
+      });
+    previewTimesCache[type] = { at: now, promise };
+    return promise;
+  }
+
   // Keep the home page's "Anime/Manga in Progress" preview in step with the
   // entry's status while the home page is loaded.
   function syncHomePreview(rec, remove) {
@@ -1935,6 +2422,9 @@
       const idx = arr.findIndex((id) => timeOf(id) < (rec.entry.updatedAt || 0));
       if (idx === -1) arr.push(rec.entry.id);
       else arr.splice(idx, 0, rec.entry.id);
+      // Real rows without a timestamp can't be compared against: fetch
+      // them and let the preview re-sort once they arrive.
+      if (arr.some((id) => !isCustomId(id) && !timeOf(id))) fillPreviewTimes(rec.type);
     } else if (!inProgress && has) {
       arr.splice(arr.indexOf(rec.entry.id), 1);
     }
@@ -2122,6 +2612,17 @@
         return false;
       }
       if (pid.indexOf('homeListPreview-') === 0) {
+        // The site's query selects only `id status score progress
+        // progressVolumes media{…}` on each row: without `updatedAt` on the
+        // real rows, the time-merge below would see them all as 0 and pin
+        // every custom entry on top. Ask for it (a harmless extra field,
+        // normalizr just keeps it on the listEntry entity) so custom
+        // entries interleave by their real last-updated position.
+        if (typeof query === 'string') {
+          const q2 = query.replace(/(mediaList\s*\([^)]*\)\s*\{)([^{}]*)/, (m, head, fields) =>
+            (/\bupdatedAt\b/.test(fields) ? m : head + 'updatedAt ' + fields));
+          if (q2 !== query) msg.params[1] = q2;
+        }
         w.__alPending.set(msg.id, { kind: 'listPreview', pageId: pid, type: vars.type, userId: vars.userId });
         return false;
       }
@@ -2147,6 +2648,10 @@
     }
     if (isCustomId(vars.id) && /\bCharacter\(/.test(query)) {
       respond(w, msg.id, characterPageResult(parseInt(vars.id, 10), vars));
+      return true;
+    }
+    if (isCustomId(vars.id) && /\bStaff\(/.test(query)) {
+      respond(w, msg.id, staffPageResult(parseInt(vars.id, 10), vars, opts));
       return true;
     }
     // Replies on a local activity: list, post, edit.
@@ -3630,6 +4135,50 @@
   // Native submission editor URL for a custom entry; media details are
   // edited there (the script prefills the form and applies submits locally).
   const editHref = (rec) => `/edit/${rec.type === 'ANIME' ? 'anime' : 'manga'}/${rec.id}`;
+  const mediaHref = (rec) => `/${rec.type === 'ANIME' ? 'anime' : 'manga'}/${rec.id}`;
+
+  // The native edit page's Submit ends with a "Submission successfully
+  // sent" toast and a push to "/" (non-mods). For a custom entry nothing
+  // was submitted, so while a local submit is fresh the toast reads as a
+  // local save and the push goes back to the entry page instead.
+  let lastLocalSubmit = null;
+  const noteLocalSubmit = (rec) => { lastLocalSubmit = { rec, at: Date.now() }; };
+  const localSubmitFresh = () => !!(lastLocalSubmit && Date.now() - lastLocalSubmit.at < 15000);
+  let submitHooksInstalled = false;
+  function installSubmitHooks() {
+    if (submitHooksInstalled) return;
+    const app = document.querySelector('#app');
+    const vm = app && app.__vue__;
+    if (!vm || !vm.$router) return;
+    let P = vm;
+    while (P && !Object.prototype.hasOwnProperty.call(P, '$notify')) P = Object.getPrototypeOf(P);
+    if (P && typeof P.$notify === 'function') {
+      const origNotify = P.$notify;
+      P.$notify = function (opts) {
+        try {
+          if (opts && typeof opts === 'object' && localSubmitFresh()
+            && /^(Submission successfully sent|Entry successfully updated)$/.test(String(opts.message || ''))) {
+            opts = Object.assign({}, opts, { message: 'Custom entry saved locally' });
+          }
+        } catch (e) { /* ignore */ }
+        return origNotify.call(this, opts);
+      };
+    }
+    const router = vm.$router;
+    const origPush = router.push;
+    router.push = function (loc, ...rest) {
+      try {
+        const path = typeof loc === 'string' ? loc : (loc && loc.path);
+        if ((path === '/' || path === '/home') && localSubmitFresh() && /^\/edit\/(anime|manga)\/\d+/.test(location.pathname)) {
+          const target = mediaHref(lastLocalSubmit.rec);
+          lastLocalSubmit = null;
+          loc = typeof loc === 'string' ? target : Object.assign({}, loc, { path: target });
+        }
+      } catch (e) { /* ignore */ }
+      return origPush.call(this, loc, ...rest);
+    };
+    submitHooksInstalled = true;
+  }
 
   // Custom media id in the current /anime/<id> or /manga/<id> route, if any.
   function mediaRouteRec() {
@@ -3659,6 +4208,7 @@
   // an Edit button in the rankings slot of a custom entry's media page.
   function ensureButtons() {
     fillSubmissionSources();
+    try { installSubmitHooks(); } catch (e) { /* best effort */ }
     try { ensureEditPanel(); } catch (e) { /* best effort */ }
     const sideBtn = document.querySelector('.alce-side-btn');
     if (routeInfo() && !sideBtn) {
@@ -3732,7 +4282,17 @@
     }
     return host;
   }
+  // Toasts use AniList's own message component (the green "Submission
+  // successfully sent" style) whenever the app is up; the DOM fallback
+  // below covers the moments before it is.
   function toast(msg, isError) {
+    const vm = document.querySelector('#app') && document.querySelector('#app').__vue__;
+    if (vm && typeof vm.$notify === 'function') {
+      try {
+        vm.$notify({ type: isError ? 'error' : 'success', message: msg, duration: isError ? 5000 : 3200 });
+        return;
+      } catch (e) { /* fall through to the DOM toast */ }
+    }
     const t = el('div', { class: 'alce-toast' + (isError ? ' err' : '') }, (isError ? '✕ ' : '✓ ') + msg);
     toastHost().appendChild(t);
     requestAnimationFrame(() => t.classList.add('show'));
@@ -4091,12 +4651,14 @@
   const INVERSE_REL = {
     SEQUEL: 'PREQUEL', PREQUEL: 'SEQUEL', SIDE_STORY: 'PARENT', SPIN_OFF: 'PARENT',
     PARENT: 'SIDE_STORY', ALTERNATIVE: 'ALTERNATIVE', ADAPTATION: 'SOURCE',
-    SOURCE: 'ADAPTATION', OTHER: 'PARENT',
+    SOURCE: 'ADAPTATION', OTHER: 'PARENT', CHARACTER: 'CHARACTER', SUMMARY: 'PARENT',
+    COMPILATION: 'CONTAINS', CONTAINS: 'COMPILATION', SAME_UNIVERSE: 'SAME_UNIVERSE',
   };
   const REL_LABELS = {
     PREQUEL: 'Prequel', SEQUEL: 'Sequel', SIDE_STORY: 'Side Story', SPIN_OFF: 'Spin-Off',
     PARENT: 'Parent', ALTERNATIVE: 'Alternative', ADAPTATION: 'Adaptation',
-    SOURCE: 'Source', OTHER: 'Other',
+    SOURCE: 'Source', OTHER: 'Other', CHARACTER: 'Character', SUMMARY: 'Summary',
+    COMPILATION: 'Compilation', CONTAINS: 'Contains', SAME_UNIVERSE: 'Same Universe',
   };
 
   function buildEditPanel(rec) {
@@ -4380,10 +4942,57 @@
       }
       if (!(rec.relations || []).length) {
         relList.appendChild(el('div', { class: 'alce-sync-status' },
-          'None yet. Fetch From MangaBaka links sequels/prequels/side stories: to another custom entry when one matches, to the real AniList entry when it exists, and otherwise creates a custom entry from the MangaBaka data.'));
+          'None yet. Add Relation in the form\'s Relations section below (Submit to save), or Fetch From MangaBaka, which links sequels/prequels/side stories: to another custom entry when one matches, to the real AniList entry when it exists, and otherwise creates a custom entry from the MangaBaka data.'));
       }
     };
     renderRels();
+
+    // --- staff + external links managers: the native form adds them (its
+    // Staff / External Links sections, Submit to save) but only shows a
+    // delete control to data mods, so removal lives here. ---
+    const staffList = el('div');
+    const renderStaff = () => {
+      staffList.textContent = '';
+      for (const st of rec.staff || []) {
+        const name = staffNameOf(st).userPreferred;
+        staffList.appendChild(itemRow(
+          { title: { userPreferred: name }, coverImage: { medium: st.image || null } },
+          name,
+          (st.role || 'No role') + (st.isCustom ? ' · Local staff' : ' · AniList staff'),
+          () => {
+            rec.staff = (rec.staff || []).filter((x) => x !== st);
+            touchRec(rec);
+            saveDB();
+            pushRecEntities(rec);
+            renderStaff();
+          },
+        ));
+      }
+      if (!(rec.staff || []).length) {
+        staffList.appendChild(el('div', { class: 'alce-sync-status' },
+          'None yet. Use Add Staff / Create New Staff in the form\'s Staff section below, then Submit.'));
+      }
+    };
+    renderStaff();
+
+    const linkList = el('div');
+    const renderLinks = () => {
+      linkList.textContent = '';
+      for (const l of md.externalLinks || []) {
+        linkList.appendChild(itemRow(null, l.site || 'Link', l.url + (l.notes ? ' · ' + l.notes : ''), () => {
+          md.externalLinks = (md.externalLinks || []).filter((x) => x !== l);
+          touchRec(rec);
+          saveDB();
+          pushRecEntities(rec);
+          renderLinks();
+        }));
+      }
+      if (!(md.externalLinks || []).length) {
+        linkList.appendChild(el('div', { class: 'alce-sync-status' },
+          'None yet. Use Add Link in the form\'s External Links section below, then Submit.'));
+      }
+    };
+    renderLinks();
 
     const fetchMbRels = async () => {
       if (mbBusy) return;
@@ -4566,6 +5175,10 @@
         el('div', { class: 'alce-manage-title', style: 'margin-top: 16px' }, 'Relations'),
         relList,
         ...(rec.external && rec.external.mangabaka ? [el('div', { class: 'alce-panel-btns' }, relsBtn)] : []),
+        el('div', { class: 'alce-manage-title', style: 'margin-top: 16px' }, 'Staff'),
+        staffList,
+        el('div', { class: 'alce-manage-title', style: 'margin-top: 16px' }, 'External Links'),
+        linkList,
       ));
   }
 
@@ -5165,6 +5778,9 @@
         completedAt: { year: null, month: null, day: null },
       },
     };
+    // A fresh entry gets the same status side effects as a save (created
+    // as Completed on a finished series → progress filled, dates stamped).
+    applyStatusEffects(rec, f.status);
     db.entries[id] = rec;
     saveDB();
     // The server would create a "plans to watch/read" (or "completed")
@@ -5187,9 +5803,9 @@
       const nav = performance.getEntriesByType('navigation')[0];
       const origPath = nav ? new URL(nav.name).pathname : null;
       if (location.pathname === '/404' && origPath && origPath !== '/404') {
-        const m = origPath.match(/^\/(anime|manga|character|activity)\/(\d+)|^\/edit\/(anime|manga)\/(\d+)/);
+        const m = origPath.match(/^\/(anime|manga|character|staff|activity)\/(\d+)|^\/edit\/(anime|manga)\/(\d+)/);
         const id = m ? parseInt(m[2] || m[4], 10) : NaN;
-        if (isCustomId(id) && (recById(id) || findCharOwner(id) || activityById(id))) {
+        if (isCustomId(id) && (recById(id) || findCharOwner(id) || staffLinksFor(id).length || activityById(id))) {
           const app = document.querySelector('#app');
           const router = app && app.__vue__ && app.__vue__.$router;
           if (router) {
