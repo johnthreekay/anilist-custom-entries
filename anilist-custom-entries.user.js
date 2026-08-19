@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AniList Custom Entries
 // @namespace    al-custom-entries
-// @version      1.37.16
+// @version      1.40.2
 // @description  Create fully client-side custom anime/manga entries on AniList that behave like normal list entries (rate, note, custom lists, progress, favourite, delete) via the native UI, including local activity feed entries and the home page's in-progress lists. Optionally syncs the database to a private GitHub repo for cross-device use.
 // @author       john
 // @homepageURL  https://github.com/johnthreekay/anilist-custom-entries
@@ -36,7 +36,7 @@
   const window = (typeof unsafeWindow === 'object' && unsafeWindow) ? unsafeWindow : globalThis;
 
   const TAG = '[AL-Custom]';
-  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.37.16'; } catch (e) { /* diagnostics only */ }
+  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.40.2'; } catch (e) { /* diagnostics only */ }
   const ID_BASE = 2000000000; // far above any real AniList media/entry id, still within GraphQL Int32
   const LS_KEY = 'al-custom-entries-v1';
 
@@ -99,7 +99,8 @@
   //   1: pre-1.8 (entries, owners, seq)   2: activities   3: deleted
   //   4: favOrder                          5: per-record arrays (characters,
   //   staff, relations, recs, history), media.externalLinks / tags / genres
-  const DB_VERSION = 5;
+  //   6: media.studios (linked real studios)   7: reviews
+  const DB_VERSION = 7;
   function migrateDB(d) {
     if (!d || typeof d !== 'object') return d;
     const from = d.version || 0;
@@ -113,8 +114,8 @@
       if (!rec || typeof rec !== 'object') continue;
       rec.media = rec.media || {};
       rec.entry = rec.entry || {};
-      for (const k of ['characters', 'staff', 'relations', 'recs', 'history']) if (!Array.isArray(rec[k])) rec[k] = [];
-      for (const k of ['genres', 'tags', 'synonyms', 'externalLinks']) if (!Array.isArray(rec.media[k])) rec.media[k] = [];
+      for (const k of ['characters', 'staff', 'relations', 'recs', 'history', 'reviews']) if (!Array.isArray(rec[k])) rec[k] = [];
+      for (const k of ['genres', 'tags', 'synonyms', 'externalLinks', 'studios']) if (!Array.isArray(rec.media[k])) rec.media[k] = [];
       if (!rec.media.title || typeof rec.media.title !== 'object') rec.media.title = { userPreferred: String(rec.media.title || 'Untitled') };
     }
     d.version = DB_VERSION;
@@ -269,6 +270,8 @@
       for (const c of out.entries[id].characters || []) bump(c.id);
       for (const st of out.entries[id].staff || []) { bump(st.id); bump(st.staffId); }
       for (const h of out.entries[id].history || []) bump(h.id);
+      for (const st of (out.entries[id].media && out.entries[id].media.studios) || []) bump(st.id);
+      for (const rv of out.entries[id].reviews || []) bump(rv.id);
     }
     for (const id of Object.keys(out.activities)) {
       bump(id);
@@ -729,6 +732,7 @@
     || Object.values(rec.entry.customLists || {}).some(Boolean));
 
   function mediaEntity(rec) {
+    try { enrichRecTags(rec); } catch (e) { /* catalog not loaded yet */ }
     const m = Object.assign({}, rec.media, { mediaListEntry: recIsListed(rec) ? rec.id : null });
     if (m.description) m.description = sanitizeHtml(m.description);
     return m;
@@ -823,6 +827,16 @@
     media.characterPreview = 'mediaCharacterPreview-' + id;
     media.staffPreview = 'mediaStaffPreview-' + id;
     media.reviewPreview = 'mediaReviewPreview-' + id;
+    const reviewEntities = {};
+    const reviewUsers = {};
+    const myReviews = (rec.reviews || []).filter((rv) => !rv.private || rv.userId === authUserId());
+    if (myReviews.length) {
+      const ids = myReviews.slice().sort((a, b) => (b.rating || 0) - (a.rating || 0) || b.id - a.id).map((rv) => rv.id);
+      for (const rv of myReviews) { reviewEntities[rv.id] = reviewEntity(rec, rv); reviewUsers[rv.userId] = activityUserEntity(rv.userId); }
+      const info = { total: ids.length, perPage: 25, currentPage: 1, lastPage: 1, hasNextPage: false };
+      page['mediaReviewPreview-' + id] = { pageInfo: info, pageData: ids };
+      page['mediaReviews-' + id] = { pageInfo: info, pageData: ids };
+    }
     media.characters = 'mediaCharacters-' + id;
     media.staff = 'mediaStaff-' + id;
     media.reviews = 'mediaReviews-' + id;
@@ -871,9 +885,12 @@
     }
 
     const studioEntities = {};
-    if (rec.media.studioName) {
-      studioEntities[id] = { id, name: rec.media.studioName, isAnimationStudio: true, isFavourite: false };
-      media.studios = { edges: [{ id, isMain: true, node: id }] };
+    const studioLinks = studiosOf(rec);
+    if (studioLinks.length) {
+      for (const st of studioLinks) {
+        studioEntities[st.studioId] = { id: st.studioId, name: st.name || 'Studio #' + st.studioId, isAnimationStudio: st.isAnimationStudio !== false, isFavourite: !!(db.favStudios && db.favStudios[st.studioId]) };
+      }
+      media.studios = { edges: studioLinks.map((st) => ({ id: st.id, isMain: !!st.isMain, node: st.studioId })) };
     }
 
     const recommendationEntities = {};
@@ -907,11 +924,12 @@
       entities: {
         media: mediaEntities,
         listEntry: recIsListed(rec) ? { [rec.entry.id]: entryEntity(rec) } : {},
-        user: { [rec.ownerId]: userEntity(rec.ownerId) },
+        user: Object.assign({ [rec.ownerId]: userEntity(rec.ownerId) }, reviewUsers),
         character: characterEntities,
         staff: staffEntities,
         studio: studioEntities,
         recommendation: recommendationEntities,
+        review: reviewEntities,
         page,
       },
     };
@@ -1228,6 +1246,111 @@
   }
 
   // Full result for the /activity/<id> permalink page of a local activity.
+  /* --- local reviews: rec.reviews = [{id, userId, summary, body, score,
+   * private, createdAt, updatedAt, rating (up votes), ratingAmount (votes),
+   * userRating}]. Written by AniList's own review editor (SaveReview on a
+   * custom media id), rated and deleted natively, shown on the media page
+   * (preview + Reviews tab), the profile's Reviews tab and /review/<id>. --- */
+  function findReview(reviewId) {
+    for (const rec of allRecs()) {
+      const rv = (rec.reviews || []).find((x) => x.id === reviewId);
+      if (rv) return { rec, rv };
+    }
+    return null;
+  }
+  function reviewEntity(rec, rv) {
+    return {
+      id: rv.id, summary: rv.summary || '', body: rv.body || '', rating: rv.rating || 0, ratingAmount: rv.ratingAmount || 0,
+      userRating: rv.userRating || 'NO_VOTE', score: rv.score || 0, private: !!rv.private,
+      createdAt: rv.createdAt, updatedAt: rv.updatedAt || rv.createdAt, siteUrl: location.origin + '/review/' + rv.id,
+      user: rv.userId, media: rec.id,
+    };
+  }
+  function reviewResult(rec, rv) {
+    return {
+      result: rv.id,
+      entities: {
+        review: { [rv.id]: reviewEntity(rec, rv) },
+        user: { [rv.userId]: activityUserEntity(rv.userId) },
+        media: { [rec.id]: mediaEntity(rec) },
+      },
+    };
+  }
+  function handleSaveReview(vars) {
+    const id = isCustomId(vars.id) ? parseInt(vars.id, 10) : null;
+    const hit = id ? findReview(id) : null;
+    const rec = hit ? hit.rec : (isCustomId(vars.mediaId) ? recById(parseInt(vars.mediaId, 10)) : null);
+    if (!rec) return { result: null, entities: {} };
+    rec.reviews = rec.reviews || [];
+    const uid = authUserId() || rec.ownerId;
+    let rv = hit ? hit.rv : rec.reviews.find((x) => x.userId === uid);
+    const now = nowSec();
+    if (!rv) {
+      db.seq += 1;
+      rv = { id: ID_BASE + db.seq, userId: uid, summary: '', body: '', score: 0, private: false, createdAt: now, updatedAt: now, rating: 0, ratingAmount: 0, userRating: 'NO_VOTE' };
+      rec.reviews.push(rv);
+    }
+    if (vars.summary !== undefined) rv.summary = String(vars.summary || '');
+    if (vars.body !== undefined) rv.body = String(vars.body || '');
+    if (vars.score !== undefined) rv.score = parseInt(vars.score, 10) || 0;
+    if (vars.private !== undefined) rv.private = !!vars.private;
+    rv.updatedAt = now;
+    touchRec(rec);
+    saveDB();
+    pushRecEntities(rec);
+    console.log(TAG, 'saved local review', rv.id, 'on', rec.id);
+    return reviewResult(rec, rv);
+  }
+  function handleRateReview(vars) {
+    const hit = findReview(parseInt(vars.id !== undefined ? vars.id : vars.reviewId, 10));
+    if (!hit) return { result: null, entities: {} };
+    const { rec, rv } = hit;
+    const prev = rv.userRating || 'NO_VOTE';
+    const next = String(vars.rating || 'NO_VOTE');
+    // One voter: up votes and the vote count follow the viewer's own vote.
+    if (prev === 'UP_VOTE') rv.rating = Math.max(0, (rv.rating || 0) - 1);
+    if (prev !== 'NO_VOTE') rv.ratingAmount = Math.max(0, (rv.ratingAmount || 0) - 1);
+    if (next === 'UP_VOTE') rv.rating = (rv.rating || 0) + 1;
+    if (next !== 'NO_VOTE') rv.ratingAmount = (rv.ratingAmount || 0) + 1;
+    rv.userRating = next;
+    touchRec(rec);
+    saveDB();
+    return reviewResult(rec, rv);
+  }
+  function handleDeleteReview(vars) {
+    const hit = findReview(parseInt(vars.id, 10));
+    if (hit) {
+      hit.rec.reviews = hit.rec.reviews.filter((x) => x.id !== hit.rv.id);
+      touchRec(hit.rec);
+      saveDB();
+      pushRecEntities(hit.rec);
+    }
+    return { result: null, entities: {} };
+  }
+  // Profile Reviews tab: prepend the user's local reviews on page 1.
+  function patchUserReviews(result, meta) {
+    const ents = result.entities;
+    const pg = ents && ents.page && ents.page[meta.pageId];
+    if (!pg || !Array.isArray(pg.pageData) || (meta.vars.page || 1) !== 1) return;
+    const uid = parseInt(meta.userId, 10);
+    const mine = [];
+    for (const rec of allRecs()) for (const rv of rec.reviews || []) if (rv.userId === uid && !rv.private) mine.push({ rec, rv });
+    if (!mine.length) return;
+    mine.sort((a, b) => b.rv.createdAt - a.rv.createdAt);
+    ents.review = ents.review || {};
+    ents.media = ents.media || {};
+    ents.user = ents.user || {};
+    for (let i = mine.length - 1; i >= 0; i--) {
+      const { rec, rv } = mine[i];
+      if (pg.pageData.includes(rv.id)) continue;
+      pg.pageData.unshift(rv.id);
+      ents.review[rv.id] = reviewEntity(rec, rv);
+      ents.media[rec.id] = mediaEntity(rec);
+      if (!ents.user[rv.userId]) ents.user[rv.userId] = activityUserEntity(rv.userId);
+      if (pg.pageInfo && typeof pg.pageInfo.total === 'number') pg.pageInfo.total += 1;
+    }
+  }
+
   function activityDetailResult(a) {
     const rec = recById(a.mediaId);
     const replies = a.replies || [];
@@ -1350,6 +1473,11 @@
           for (const { rec, s: st } of links) { st.isFavourite = fav; touchRec(rec); }
           saveDB();
           console.log(TAG, 'toggled staff favourite', id, fav);
+        } else if (customEntriesWithStudio(id).length) {
+          db.favStudios = db.favStudios || {};
+          if (db.favStudios[id]) delete db.favStudios[id]; else db.favStudios[id] = true;
+          saveDB();
+          console.log(TAG, 'toggled studio favourite', id, !!db.favStudios[id]);
         }
       }
     }
@@ -1509,9 +1637,7 @@
         }),
       },
       studios: {
-        edges: md.studioName
-          ? [{ id: rec.id, isMain: true, studio: { id: rec.id, name: md.studioName } }]
-          : [],
+        edges: studiosOf(rec).map((st) => ({ id: st.id, isMain: !!st.isMain, studio: { id: st.studioId, name: st.name || 'Studio #' + st.studioId } })),
       },
       externalLinks: (md.externalLinks || []).map((l) => ({
         id: l.id, site: l.site, siteId: l.siteId, url: l.url, type: l.type || 'INFO',
@@ -1874,6 +2000,123 @@
     return { SaveMediaStaff: true };
   }
 
+  /* --- studios --- */
+  // Two kinds: a typed local studio (rec.media.studioName, anime only) with
+  // a stable id derived from its name so entries sharing the name share one
+  // /studio/<id> page, and real AniList studios linked from the edit page's
+  // "Add Studios" (rec.media.studios = [{id (link), studioId, name, isMain}]).
+  function studioIdFor(name) {
+    let h = 2166136261;
+    const str = String(name || '').trim().toLowerCase();
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+    return ID_BASE + 500000000 + (h % 400000000);
+  }
+  const localStudioOf = (rec) => (rec.media && rec.media.studioName ? { id: rec.id, studioId: studioIdFor(rec.media.studioName), name: rec.media.studioName, isMain: rec.media.studioMain !== false, isCustom: true } : null);
+  // Every studio edge of a record, local one first.
+  function studiosOf(rec) {
+    const out = [];
+    const local = localStudioOf(rec);
+    if (local) out.push(local);
+    for (const st of (rec.media && rec.media.studios) || []) if (st && st.studioId) out.push(st);
+    return out;
+  }
+  const customEntriesWithStudio = (studioId) => viewerRecs().filter((rec) => studiosOf(rec).some((st) => st.studioId === studioId));
+  function fetchStudioName(rec, link) {
+    nativeFetch.call(window, '/graphql', {
+      method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'query($id:Int){Studio(id:$id){id name isAnimationStudio}}', variables: { id: link.studioId } }),
+    }).then((r) => r.json()).then((j) => {
+      const st = j && j.data && j.data.Studio;
+      if (!st) return;
+      link.name = st.name;
+      link.isAnimationStudio = st.isAnimationStudio !== false;
+      touchRec(rec); saveDB(); pushRecEntities(rec);
+    }).catch(() => {});
+  }
+  function handleSaveMediaStudio(vars, ctxRec) {
+    const rec = isCustomId(vars.mediaId) ? recById(parseInt(vars.mediaId, 10)) : ctxRec;
+    if (!rec) return { SaveMediaStudio: true };
+    const md = rec.media;
+    md.studios = md.studios || [];
+    const linkId = isCustomId(vars.id) ? parseInt(vars.id, 10) : null;
+    const studioId = vars.studioId !== undefined && vars.studioId !== null ? parseInt(vars.studioId, 10) : null;
+    const local = localStudioOf(rec);
+    if (local && (linkId === rec.id || studioId === local.studioId)) {
+      if (vars.isMain !== undefined && vars.isMain !== null) md.studioMain = !!vars.isMain;
+    } else {
+      let link = linkId ? md.studios.find((x) => x.id === linkId) : null;
+      if (!link && studioId) {
+        link = md.studios.find((x) => x.studioId === studioId);
+        if (!link) {
+          db.seq += 1;
+          link = { id: ID_BASE + db.seq, studioId, name: null, isMain: false, isAnimationStudio: true };
+          const store = vueStore();
+          const sents = store && entitiesState(store);
+          const known = sents && sents.studio && sents.studio[studioId]; // the Add Studios search normalized it
+          if (known && known.name) { link.name = known.name; link.isAnimationStudio = known.isAnimationStudio !== false; }
+          md.studios.push(link);
+          if (!link.name) fetchStudioName(rec, link);
+        }
+      }
+      if (link && vars.isMain !== undefined && vars.isMain !== null) link.isMain = !!vars.isMain;
+    }
+    logRevision(rec, 'EDIT', { studios: 'Modified' });
+    touchRec(rec); saveDB(); pushRecEntities(rec);
+    return { SaveMediaStudio: true };
+  }
+  function removeStudioLink(rec, linkId) {
+    const md = rec.media;
+    if (linkId === rec.id) { md.studioName = null; delete md.studioMain; }
+    else md.studios = (md.studios || []).filter((x) => x.id !== linkId);
+    logRevision(rec, 'EDIT', { studios: 'Modified' });
+    touchRec(rec); saveDB(); pushRecEntities(rec);
+  }
+  // Local /studio/<id> page: the entries carrying that studio name.
+  function studioPageResult(sid, vars, opts) {
+    const recs = customEntriesWithStudio(sid);
+    if (!recs.length) return { result: null, entities: {} };
+    const name = (studiosOf(recs[0]).find((st) => st.studioId === sid) || {}).name || 'Studio';
+    const pageId = opts && opts.page && opts.page.id ? String(opts.page.id) : 'studioMedia-' + sid;
+    const v = vars || {};
+    const media = {};
+    const edges = [];
+    for (const rec of recs) {
+      if (!passesOnList(rec, v.onList)) continue;
+      media[rec.id] = mediaEntity(rec);
+      edges.push({ isMainStudio: !!(studiosOf(rec).find((st) => st.studioId === sid) || {}).isMain, node: rec.id });
+    }
+    const pg = { pageInfo: { total: edges.length, perPage: 25, currentPage: v.page || 1, lastPage: 1, hasNextPage: false }, pageData: edges };
+    return {
+      result: sid,
+      entities: {
+        studio: { [sid]: { id: sid, name, isAnimationStudio: true, favourites: 0, isFavourite: !!(db.favStudios && db.favStudios[sid]), isFavouriteBlocked: false, media: 'studioMedia-' + sid } },
+        media,
+        page: { [pageId]: pg, ['studioMedia-' + sid]: pg },
+      },
+    };
+  }
+  // Real studio page: prepend the custom entries linked to it.
+  function addStudioBacklinks(arr, ents, pageInfo, hits) {
+    let n = 0;
+    for (const { rec, st } of hits) {
+      if (arr.some((e) => e && e.node === rec.id)) continue;
+      arr.unshift({ isMainStudio: !!st.isMain, node: rec.id });
+      ents.media = ents.media || {};
+      ents.media[rec.id] = mediaEntity(rec);
+      n++;
+    }
+    if (n && pageInfo && typeof pageInfo.total === 'number') pageInfo.total += n;
+    return n;
+  }
+  const studioHits = (studioId, onList) => customEntriesWithStudio(studioId).filter((rec) => passesOnList(rec, onList)).map((rec) => ({ rec, st: studiosOf(rec).find((x) => x.studioId === studioId) }));
+  function patchStudioBacklinks(result, meta) {
+    const ents = result.entities;
+    const pg = ents && ents.page && ents.page[meta.pageId];
+    if (!pg || !Array.isArray(pg.pageData) || (meta.vars.page || 1) !== 1) return;
+    const n = addStudioBacklinks(pg.pageData, ents, pg.pageInfo, studioHits(meta.id, meta.vars.onList));
+    if (n) console.log(TAG, `added ${n} custom entr${n === 1 ? 'y' : 'ies'} to studio ${meta.id}`);
+  }
+
   // Local /staff/<id> page for staff created locally: header data plus the
   // roles on custom entries. The site keys the roles pages by its own page
   // id (vars JSON), which arrives in the RPC options; the entity's own
@@ -2156,6 +2399,22 @@
       pendingChars.delete(parseInt(vars.id, 10));
       return { DeleteCharacter: { deleted: true } };
     }
+    // Reviews: the editor's save and the review page's rate / delete go
+    // through the plain client (raw data shape).
+    if (query.includes('SaveReview') && (isCustomId(vars.mediaId) || isCustomId(vars.id))) {
+      const r = handleSaveReview(vars);
+      const rv = r.result ? r.entities.review[r.result] : null;
+      return { SaveReview: rv ? { id: rv.id, mediaId: rv.media, userId: rv.user } : null };
+    }
+    if (query.includes('RateReview') && (isCustomId(vars.id) || isCustomId(vars.reviewId))) {
+      const r = handleRateReview(vars);
+      const rv = r.result ? r.entities.review[r.result] : null;
+      return { RateReview: rv ? { id: rv.id, userRating: rv.userRating, rating: rv.rating, ratingAmount: rv.ratingAmount } : null };
+    }
+    if (query.includes('DeleteReview') && isCustomId(vars.id)) {
+      handleDeleteReview(vars);
+      return { DeleteReview: { deleted: true } };
+    }
     // Relations / external links on the edit page.
     if (query.includes('SaveMediaRelation(')) return handleSaveMediaRelation(vars, ctxRec);
     if (query.includes('DeleteMediaRelation(')) {
@@ -2181,6 +2440,15 @@
         console.log(TAG, 'external link removed locally', lid);
       }
       return { DeleteMediaExternalLink: { deleted: true } };
+    }
+    // Studios on the edit page: "Add Studios" (real studios) and the main flag.
+    if (query.includes('SaveMediaStudio(')) return handleSaveMediaStudio(vars, ctxRec);
+    if (query.includes('DeleteMediaStudio(')) {
+      const lid = parseInt(vars.id, 10);
+      for (const rec of allRecs()) {
+        if (lid === rec.id ? !!rec.media.studioName : (rec.media.studios || []).some((x) => x.id === lid)) removeStudioLink(rec, lid);
+      }
+      return { DeleteMediaStudio: { deleted: true } };
     }
     // Staff on the edit page: "Add Staff" (real AniList staff), "Create New
     // Staff" (local), role edits and the row's trash button.
@@ -2216,15 +2484,16 @@
       const name = String(vars.name || '').trim();
       if (rec && name && !(rec.media.tags || []).some((t) => t.name.toLowerCase() === name.toLowerCase())) {
         rec.media.tags = rec.media.tags || [];
+        const cat = catalogTag(name);
         rec.media.tags.push({
           id: ID_BASE + (++db.seq),
-          name,
+          name: cat ? cat.name : name,
           rank: 100,
           isMediaSpoiler: !!vars.isMediaSpoiler,
-          isGeneralSpoiler: false,
-          isAdult: false,
-          category: null,
-          description: null,
+          isGeneralSpoiler: !!(cat && cat.isGeneralSpoiler),
+          isAdult: !!(cat && cat.isAdult),
+          category: cat ? cat.category || null : null,
+          description: cat ? cat.description || null : null,
           userId: authUserId(),
         });
         logRevision(rec, 'EDIT', { tags: 'Modified' });
@@ -2251,8 +2520,7 @@
       }
       return { SaveMediaTagVote: true };
     }
-    // Anything else (studio submissions…) must never reach the server while
-    // a custom entry is in play.
+    // Anything else must never reach the server while a custom entry is in play.
     console.warn(TAG, 'blocked submission mutation for custom entry', query.slice(0, 90));
     return {};
   }
@@ -2623,6 +2891,42 @@
     }
   }
 
+  // Late injection: the profile's favourites arrive with the first User
+  // query, which can run before the hooks; patch the store's pages the same
+  // way, but only when a custom favourite is actually missing (the patch
+  // re-sorts arrays, which would re-render every tick otherwise).
+  function healFavourites() {
+    const store = vueStore();
+    const ents = store && entitiesState(store);
+    if (!ents || !ents.page) return;
+    let missing = false;
+    for (const key of Object.keys(ents.page)) {
+      const m = key.match(/^favourite(Anime|Manga|Characters)-(\d+)$/);
+      if (!m) continue;
+      const p = ents.page[key];
+      if (!p || !p.pageData || (p.pageInfo && p.pageInfo.hasNextPage)) continue;
+      const nums = Object.keys(p.pageData).map(Number).filter(Number.isFinite);
+      const arr = Array.isArray(p.pageData) ? p.pageData : (nums.length ? p.pageData[Math.max(...nums)] : null);
+      if (!Array.isArray(arr)) continue;
+      const uid = parseInt(m[2], 10);
+      const present = new Set(arr.map((e) => e && e.node));
+      for (const rec of allRecs()) {
+        if (rec.ownerId !== uid) continue;
+        if (m[1] === 'Characters') { if ((rec.characters || []).some((c) => c.isFavourite && !present.has(c.id))) missing = true; }
+        else if (rec.type === (m[1] === 'Anime' ? 'ANIME' : 'MANGA') && rec.media.isFavourite && !present.has(rec.id)) missing = true;
+        if (missing) break;
+      }
+      if (missing) break;
+    }
+    if (!missing) return;
+    const fake = { entities: { page: ents.page } };
+    patchFavouritesResult(fake);
+    const patch = {};
+    if (fake.entities.media) patch.media = fake.entities.media;
+    if (fake.entities.character) patch.character = fake.entities.character;
+    if (Object.keys(patch).length) { try { store.commit('setEntities', patch); } catch (e) { /* ignore */ } }
+  }
+
   // Re-apply a locally saved reorder (see cleanFavouriteOrder). Only when
   // the list fits one page; on multi-page lists customs stay appended.
   function applySavedFavOrder(kind, p, arr) {
@@ -2960,7 +3264,8 @@
     for (const key of Object.keys(ents.page || {})) {
       const isChar = key.indexOf('characterMediaRoles-{') === 0;
       const isStaff = key.indexOf('staffMediaRoles-{') === 0;
-      if (!isChar && !isStaff) continue;
+      const isStudio = key.indexOf('studioMedia-{') === 0;
+      if (!isChar && !isStaff && !isStudio) continue;
       let v;
       try { v = JSON.parse(key.slice(key.indexOf('{'))); } catch (e) { continue; }
       const id = parseInt(v && v.id, 10);
@@ -2969,7 +3274,8 @@
       const arr = pg && pg.pageData && pg.pageData[1];
       if (!Array.isArray(arr)) continue;
       if (isChar) changed += addCharacterBacklinks(arr, patch, pg.pageInfo, customEntriesWithCharacter(id).filter((h) => passesOnList(h.rec, v.onList)));
-      else changed += addStaffBacklinks(arr, patch, pg.pageInfo, customEntriesWithStaff(id, v.type || null).filter((h) => passesOnList(h.rec, v.onList)));
+      else if (isStaff) changed += addStaffBacklinks(arr, patch, pg.pageInfo, customEntriesWithStaff(id, v.type || null).filter((h) => passesOnList(h.rec, v.onList)));
+      else changed += addStudioBacklinks(arr, patch, pg.pageInfo, studioHits(id, v.onList));
     }
     if (changed && patch.media) { try { store.commit('setEntities', { media: patch.media }); } catch (e) { /* ignore */ } }
   }
@@ -3011,6 +3317,50 @@
     patchUserStatistics(result);
   }
 
+  /* --- AniList's tag catalog (MediaTagCollection), for enriching tags that
+   * only carry a name (imports, the sidebar "+"): real id, category,
+   * description (the hover bubble), adult flag. Cached for a week. --- */
+  const TAG_CACHE_KEY = 'al-custom-entries-tags-v2';
+  let tagCatalog = null; // Map(lowercase name → tag)
+  function loadTagCatalog() {
+    try {
+      const raw = localStorage.getItem(TAG_CACHE_KEY);
+      if (raw) {
+        const c = JSON.parse(raw);
+        if (c && Array.isArray(c.tags) && nowSec() - (c.at || 0) < 7 * 86400) { setTagCatalog(c.tags); return; }
+      }
+    } catch (e) { /* refetch */ }
+    nativeFetch.call(window, '/graphql', {
+      method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'query{MediaTagCollection{id name description category isAdult isGeneralSpoiler}}' }),
+    }).then((r) => r.json()).then((j) => {
+      const tags = j && j.data && j.data.MediaTagCollection;
+      if (!Array.isArray(tags) || !tags.length) return;
+      try { localStorage.setItem(TAG_CACHE_KEY, JSON.stringify({ at: nowSec(), tags })); } catch (e) { /* ignore */ }
+      setTagCatalog(tags);
+    }).catch(() => {});
+  }
+  function setTagCatalog(tags) {
+    tagCatalog = new Map();
+    for (const t of tags) if (t && t.name) tagCatalog.set(String(t.name).toLowerCase(), t);
+    for (const rec of allRecs()) enrichRecTags(rec);
+  }
+  // In-memory only (no save, no sync churn): the stored record keeps just
+  // what the user entered; the catalog fields ride along on every render.
+  function enrichRecTags(rec) {
+    if (!tagCatalog || !rec || !rec.media || !Array.isArray(rec.media.tags)) return;
+    for (const t of rec.media.tags) {
+      if (!t || !t.name || t.category) continue;
+      const c = tagCatalog.get(String(t.name).toLowerCase());
+      if (!c) continue;
+      t.category = c.category || null;
+      if (!t.description) t.description = c.description || null;
+      if (c.isAdult) t.isAdult = true;
+      if (c.isGeneralSpoiler) t.isGeneralSpoiler = true;
+    }
+  }
+  const catalogTag = (name) => (tagCatalog ? tagCatalog.get(String(name || '').toLowerCase()) || null : null);
+
   // Profile / stats pages: User.statistics.{anime,manga} come straight from
   // the server, so custom entries are missing from "Chapters Read" and
   // friends. Add each listed custom entry of that user to the totals
@@ -3020,7 +3370,28 @@
   // custom entry so the Stats pages' cards show its cover. Only fields the
   // response already has are touched; meanScore/standardDeviation stay as
   // served.
+  // Chapter / episode count buckets, labelled the way the Stats pages do.
+  function lengthBucket(rec) {
+    const n = rec.type === 'ANIME' ? rec.media.episodes : rec.media.chapters;
+    if (!n || n < 1) return null;
+    if (n === 1) return '1';
+    if (rec.type === 'ANIME') return n <= 6 ? '2-6' : n <= 16 ? '7-16' : n <= 28 ? '17-28' : n <= 55 ? '29-55' : n <= 100 ? '56-100' : '101+';
+    return n <= 10 ? '2-10' : n <= 25 ? '11-25' : n <= 50 ? '26-50' : n <= 100 ? '51-100' : n <= 200 ? '101-200' : '201+';
+  }
+  // Scores: the profile reports meanScore on a 0-100 scale; entries are
+  // scored in the account's format, so convert before blending.
+  function score100(rec) {
+    const sc = parseFloat(rec.entry && rec.entry.score);
+    if (!Number.isFinite(sc) || sc <= 0) return null;
+    const fmt = (ownerOpts(rec) || {}).scoreFormat || 'POINT_100';
+    if (fmt === 'POINT_10' || fmt === 'POINT_10_DECIMAL') return Math.min(100, sc * 10);
+    if (fmt === 'POINT_5') return Math.min(100, sc * 20);
+    if (fmt === 'POINT_3') return sc >= 3 ? 85 : (sc >= 2 ? 60 : 35);
+    return Math.min(100, sc);
+  }
   const STAT_BUCKETS = {
+    lengths: ['length', (rec) => [lengthBucket(rec)]],
+    scores: ['score', (rec) => [rec.entry && rec.entry.score > 0 ? Math.round(rec.entry.score) : null]],
     formats: ['format', (rec) => [rec.media.format]],
     statuses: ['status', (rec) => [rec.entry.status]],
     releaseYears: ['releaseYear', (rec) => [rec.media.startDate && rec.media.startDate.year]],
@@ -3029,6 +3400,7 @@
     genres: ['genre', (rec) => rec.media.genres || []],
     genrePreview: ['genre', (rec) => rec.media.genres || []],
     tags: ['tag', (rec) => (rec.media.tags || []).map((t) => t && t.name)],
+    studios: ['studio', (rec) => studiosOf(rec).map((st) => st.name)],
   };
   const STAT_TOTALS = ['count', 'episodesWatched', 'minutesWatched', 'chaptersRead', 'volumesRead'];
   function recStatContribution(rec) {
@@ -3046,8 +3418,8 @@
   const bumpStatTotals = (obj, c) => {
     for (const k of STAT_TOTALS) if (typeof obj[k] === 'number') obj[k] += c[k];
   };
-  const bucketMatches = (b, key, value) => (key === 'tag'
-    ? !!(b.tag && String(b.tag.name).toLowerCase() === String(value).toLowerCase())
+  const bucketMatches = (b, key, value) => ((key === 'tag' || key === 'studio')
+    ? !!(b[key] && String(b[key].name).toLowerCase() === String(value).toLowerCase())
     : (key === 'genre' ? String(b.genre).toLowerCase() === String(value).toLowerCase() : b[key] === value));
   function newStatBucket(list, parent, key, value, listKey) {
     const b = {};
@@ -3063,7 +3435,7 @@
       }
       if (listKey !== 'genrePreview') b.mediaIds = [];
     }
-    b[key] = key === 'tag' ? { id: 0, name: value } : value;
+    b[key] = (key === 'tag' || key === 'studio') ? { id: 0, name: value } : value;
     list.push(b);
     return b;
   }
@@ -3146,11 +3518,27 @@
         const contribs = recs.map(recStatContribution);
         // Totals: per key, skip when still at the post-bump value.
         let touched = false;
+        const countBefore = typeof st.count === 'number' ? st.count : 0;
         for (const k of STAT_TOTALS) {
           if (typeof st[k] !== 'number' || mark[k] === st[k]) continue;
           for (const c of contribs) st[k] += c[k];
           mark[k] = st[k];
           touched = true;
+        }
+        // Mean score: blend the custom entries' scores (converted to 0-100)
+        // into the served mean. The server's mean averages scored entries
+        // only and their number isn't served, so the served count stands in
+        // for it; a mean of 0 means nothing scored, then only custom scores
+        // count.
+        if (typeof st.meanScore === 'number' && mark.meanScore !== st.meanScore) {
+          const scored = recs.map(score100).filter((v) => v !== null);
+          if (scored.length) {
+            const nReal = st.meanScore > 0 ? Math.max(0, countBefore) : 0;
+            const sum = st.meanScore * nReal + scored.reduce((a, b) => a + b, 0);
+            st.meanScore = Math.round((sum / (nReal + scored.length)) * 10) / 10;
+            touched = true;
+          }
+          mark.meanScore = st.meanScore;
         }
         // Breakdown buckets.
         for (const [listKey, [key, valuesOf]] of Object.entries(STAT_BUCKETS)) {
@@ -3162,7 +3550,9 @@
             const rec = recs[i];
             const c = contribs[i];
             for (const value of valuesOf(rec)) {
-              if (value === null || value === undefined || value === '') continue;
+              // "Unknown" length is a real bucket (length: null); every other
+              // list skips missing values.
+              if (value === undefined || value === '' || (value === null && listKey !== 'lengths')) continue;
               const b = list.find((x) => x && bucketMatches(x, key, value)) || newStatBucket(list, st, key, value, listKey);
               if (byIds) {
                 if (!Array.isArray(b.mediaIds)) b.mediaIds = [];
@@ -3252,6 +3642,11 @@
         w.__alPending.set(msg.id, { kind: 'search', pageId: pid, vars });
         return false;
       }
+      // Profile Reviews tab: forward, then prepend the user's local reviews.
+      if (pid.indexOf('userReviews-') === 0 && pageOpt.key === 'reviews') {
+        w.__alPending.set(msg.id, { kind: 'userReviews', pageId: pid, userId: pid.slice('userReviews-'.length), vars });
+        return false;
+      }
       if (pid.indexOf('homeListPreview-') === 0) {
         // The site's query selects only `id status score progress
         // progressVolumes media{…}` on each row: without `updatedAt` on the
@@ -3286,6 +3681,8 @@
         if (customEntriesWithCharacter(rid).length) w.__alPending.set(msg.id, { kind: 'characterBacklinks', id: rid, pageId: String(pageOpt.id), vars });
       } else if (rid && opts.schema === 'staff' && vars.withStaffRoles && pageOpt && pageOpt.id) {
         if (customEntriesWithStaff(rid, vars.type || null).length) w.__alPending.set(msg.id, { kind: 'staffBacklinks', id: rid, pageId: String(pageOpt.id), vars });
+      } else if (rid && opts.schema === 'studio' && pageOpt && pageOpt.id) {
+        if (customEntriesWithStudio(rid).length) w.__alPending.set(msg.id, { kind: 'studioBacklinks', id: rid, pageId: String(pageOpt.id), vars });
       }
     }
 
@@ -3332,6 +3729,35 @@
     }
     if (isCustomId(vars.id) && /\bStaff\(/.test(query)) {
       respond(w, msg.id, staffPageResult(parseInt(vars.id, 10), vars, opts));
+      return true;
+    }
+    if (isCustomId(vars.id) && /\bStudio\(/.test(query)) {
+      respond(w, msg.id, studioPageResult(parseInt(vars.id, 10), vars, opts));
+      return true;
+    }
+    // Reviews on custom entries: the editor's lookup (mediaId + userId), the
+    // review page (id), saving, rating and deleting.
+    if (/\bReview\(/.test(query) && (isCustomId(vars.mediaId) || isCustomId(vars.id))) {
+      let hit = isCustomId(vars.id) ? findReview(parseInt(vars.id, 10)) : null;
+      if (!hit && isCustomId(vars.mediaId)) {
+        const rec = recById(parseInt(vars.mediaId, 10));
+        const uid = vars.userId !== undefined && vars.userId !== null ? parseInt(vars.userId, 10) : authUserId();
+        const rv = rec && (rec.reviews || []).find((x) => x.userId === uid);
+        if (rec && rv) hit = { rec, rv };
+      }
+      respond(w, msg.id, hit ? reviewResult(hit.rec, hit.rv) : { result: null, entities: {} });
+      return true;
+    }
+    if (query.includes('SaveReview') && (isCustomId(vars.mediaId) || isCustomId(vars.id))) {
+      respond(w, msg.id, handleSaveReview(vars));
+      return true;
+    }
+    if (query.includes('RateReview') && (isCustomId(vars.id) || isCustomId(vars.reviewId))) {
+      respond(w, msg.id, handleRateReview(vars));
+      return true;
+    }
+    if (query.includes('DeleteReview') && isCustomId(vars.id)) {
+      respond(w, msg.id, handleDeleteReview(vars));
       return true;
     }
     // Replies on a local activity: list, post, edit.
@@ -3459,6 +3885,8 @@
             else if (meta.kind === 'mediaBacklinks') patchMediaBacklinks(d.result, meta);
             else if (meta.kind === 'characterBacklinks') patchCharacterBacklinks(d.result, meta);
             else if (meta.kind === 'staffBacklinks') patchStaffBacklinks(d.result, meta);
+            else if (meta.kind === 'studioBacklinks') patchStudioBacklinks(d.result, meta);
+            else if (meta.kind === 'userReviews') patchUserReviews(d.result, meta);
             else if (meta.kind === 'mediaByIds') {
               const r = d.result;
               r.result = (Array.isArray(r.result) ? r.result : []).concat(meta.ids);
@@ -4660,9 +5088,8 @@
   .alce-gear-btn { font-size: 15px; }
   .alce-side-btn svg { height: 14px; width: 14px; color: #fff; vertical-align: middle; margin: 0; }
   /* Native controls that are dead ends on a custom entry: the submission
-     Edit link (ours replaces it), Write Review, the Stats/Social tabs, and
-     the always-empty Threads section. */
-  html.alce-custom-media .sidebar a.review.button { display: none; }
+     Edit link (ours replaces it), the Stats/Social tabs, and the
+     always-empty Threads section. (Write Review works: reviews are local.) */
   html.alce-custom-media .nav .link[href$="/stats"],
   html.alce-custom-media .nav .link[href$="/social"] { display: none; }
   html.alce-custom-media .grid-section-wrap > div:has(> .threads) { display: none; }
@@ -5063,12 +5490,27 @@
 
   // Keep the "+" button next to the list sidebar's random-entry button, and
   // an Edit button in the rankings slot of a custom entry's media page.
+  // Late injection, general repair. The hooks patch responses on their way
+  // into the store; when the page's first queries ran before the hooks
+  // existed, their responses reached the store unpatched. Every store-level
+  // patcher is idempotent (membership checks or value markers), so running
+  // them against the store on the UI tick repairs whatever the initial
+  // queries brought, whenever they arrive, without caring which request
+  // was missed: statistics + activity history, search pages, relation /
+  // character / staff / studio backlinks, profile favourites. Lists, home
+  // previews and feeds are repaired by selfHeal (timed after load), and a
+  // custom page that 404'd is re-routed there.
+  function healFromStore() {
+    if (!vueStore()) return;
+    for (const fn of [healUserStatistics, healSearchPages, healBacklinks, healFavourites]) {
+      try { fn(); } catch (e) { /* best effort */ }
+    }
+  }
+
   function ensureButtons() {
     fillSubmissionSources();
     try { installSubmitHooks(); } catch (e) { /* best effort */ }
-    try { healUserStatistics(); } catch (e) { /* best effort */ }
-    try { healSearchPages(); } catch (e) { /* best effort */ }
-    try { healBacklinks(); } catch (e) { /* best effort */ }
+    healFromStore();
     try { ensureEditPanel(); } catch (e) { /* best effort */ }
     const sideBtn = document.querySelector('.alce-side-btn');
     if (routeInfo() && !sideBtn) {
@@ -5877,6 +6319,21 @@
     };
     renderChars();
 
+    const studioList = el('div');
+    const renderStudios = () => {
+      studioList.textContent = '';
+      for (const st of studiosOf(rec)) {
+        studioList.appendChild(itemRow(null, st.name || 'Studio #' + st.studioId,
+          (st.isMain ? 'Main studio' : 'Studio') + (st.isCustom ? ' · Local studio' : ' · AniList studio'),
+          () => { removeStudioLink(rec, st.id); renderStudios(); fillFromRec(); }));
+      }
+      if (!studiosOf(rec).length) {
+        studioList.appendChild(el('div', { class: 'alce-sync-status' },
+          'None yet. Type a studio in the Studio field above, or use Add Studios in the form\'s Studios section below, then Submit.'));
+      }
+    };
+    renderStudios();
+
     const linkList = el('div');
     const renderLinks = () => {
       linkList.textContent = '';
@@ -6081,6 +6538,7 @@
         charList,
         el('div', { class: 'alce-manage-title', style: 'margin-top: 16px' }, 'Staff'),
         staffList,
+        ...(anime ? [el('div', { class: 'alce-manage-title', style: 'margin-top: 16px' }, 'Studios'), studioList] : []),
         el('div', { class: 'alce-manage-title', style: 'margin-top: 16px' }, 'External Links'),
         linkList,
       ));
@@ -6108,6 +6566,16 @@
     setTimeout(() => { try { window.dispatchEvent(new Event('scroll')); } catch (err) { /* ignore */ } }, 250);
   }, true);
 
+  // The native relation dropdown lacks PARENT (the site derives it server-
+  // side); custom ↔ custom reciprocals use it, so offer it on custom entries.
+  function ensureRelationOptions() {
+    for (const node of document.querySelectorAll('.relation-row')) {
+      const vm = node.__vue__;
+      const opts = vm && vm.$data && vm.$data.relationOptions;
+      if (Array.isArray(opts) && !opts.includes('PARENT')) opts.push('PARENT');
+    }
+  }
+
   function ensureEditPanel() {
     const rec = editPageRec();
     const existing = document.querySelector('.alce-edit-panel');
@@ -6115,6 +6583,7 @@
       if (existing) existing.remove();
       return;
     }
+    try { ensureRelationOptions(); } catch (e) { /* best effort */ }
     if (existing) {
       if (existing.dataset.recId === String(rec.id)) {
         panelBelongsOnScreen(existing);
@@ -6995,9 +7464,9 @@
       if (location.pathname === '/404' && origPath && origPath !== '/404') {
         const app = document.querySelector('#app');
         const router = app && app.__vue__ && app.__vue__.$router;
-        const m = origPath.match(/^\/(anime|manga|character|staff|activity)\/(\d+)|^\/edit\/(anime|manga)\/(\d+)/);
-        const id = m ? parseInt(m[2] || m[4], 10) : NaN;
-        if (isCustomId(id) && (recById(id) || findCharOwner(id) || staffLinksFor(id).length || activityById(id))) {
+        const m = origPath.match(/^\/(anime|manga|character|staff|studio|activity|review)\/(\d+)|^\/edit\/(anime|manga)\/(\d+)|^\/review\/editor\/(\d+)/);
+        const id = m ? parseInt(m[2] || m[4] || m[5], 10) : NaN;
+        if (isCustomId(id) && (recById(id) || findCharOwner(id) || staffLinksFor(id).length || customEntriesWithStudio(id).length || activityById(id) || findReview(id))) {
           if (router) {
             console.log(TAG, 'self-healing 404 for', origPath);
             router.replace(origPath);
@@ -7062,6 +7531,7 @@
   function initUI() {
     if (uiStarted) return;
     uiStarted = true;
+    try { loadTagCatalog(); } catch (e) { /* best effort */ }
     const style = document.createElement('style');
     style.textContent = CSS + `\n:root { --alce-accent: ${profileColor()}; }`;
     document.head.appendChild(style);
