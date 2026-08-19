@@ -69,7 +69,7 @@ Setup (once):
 Notes:
 
 - The token is stored in `localStorage` on anilist.co (the script runs with `@grant none`), so scope it to that one throwaway repo only.
-- Sync happens on page load, ~4 s after any change, every 10 minutes, and on **Save & sync now**. Concurrent pushes from two devices are resolved by re-pulling and re-merging (the Contents API `sha` acts as a compare-and-swap).
+- Sync happens on page load, ~4 s after any change, every 10 minutes, and on **Save & sync now**. Concurrent pushes from two devices are resolved by re-pulling and re-merging (the Contents API `sha` acts as a compare-and-swap). The page-load and 10-minute syncs take a **fast path**: when nothing changed locally since the last sync (`syncCfg.dirty`, set by every syncing save, cleared once the push or in-sync check lands) the script only asks the Commits API for the file's latest commit (`ghHead`, ~1 KB) and compares it with the one it last synced to (`syncCfg.remoteHead`, taken from the push response or looked up after a pull); the file is downloaded, decrypted and merged only when either side moved. Manual and change-triggered syncs always run the full path.
 - Every sync is a git commit, so the repo doubles as versioned backup, you can recover any previous state from its history.
 - Files over 1 MB come back from GitHub's Contents API without content; the script transparently reads them through the Git Blobs API instead (up to 100 MB). Embedded covers are stored once in the file (`medium`/`extraLarge` collapse to an `@large` marker on disk and expand on load), so an embedded cover costs its size once, not three times. Clients older than 1.29.3 don't expand that marker: update every device together.
 - Descriptions (media and character) are stored as HTML and rendered natively, so the script **sanitizes them at render time** (tag/attribute allowlist, event handlers and non-http(s) URLs stripped). A tampered sync repo or a pasted import can therefore vandalize your data but not run script in your AniList session.
@@ -103,6 +103,12 @@ Mirroring the real AniList API: setting an entry to **Completed** auto-fills pro
 ### Database versioning
 
 The stored database carries `version` (currently 7). `migrateDB` runs on every load, import and merge result and fills in fields introduced later (activities, tombstones, favourite order, per-record `characters` / `staff` / `relations` / `recs` / `history` / `reviews` arrays, `media.externalLinks` / `tags` / `genres` / `synonyms` / `studios`), so new code can rely on the shape without scattered guards. Bump `DB_VERSION` and extend `migrateDB` when adding a field.
+
+### Performance notes
+
+- `saveDB` coalesces: any number of calls within one task serialize the database once at the end of that task (microtask), with a `pagehide` flush as a safety net, so imports, merges and multi-record saves don't re-stringify the whole database per record. `localStorage` is still written synchronously within the task, so there is no window for loss.
+- Pure per-record render helpers are memoised where they parse: `sanitizeHtml` (DOMParser) caches by raw string, the heal pass caches parsed `<name>-{json}` page-key variables. The UI tick (600 ms) otherwise only does membership checks over the store, sub-millisecond at normal store sizes.
+- Startup runs as one synchronous task (document-start), so the order of hook installation vs database load doesn't matter for the late-injection race; what matters is when the script manager injects (`__ALCE_T0`, shown in diagnostics).
 
 ### Tests
 

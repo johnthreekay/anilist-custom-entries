@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AniList Custom Entries
 // @namespace    al-custom-entries
-// @version      1.41.3
+// @version      1.41.4
 // @description  Create fully client-side custom anime/manga entries on AniList that behave like normal list entries (rate, note, custom lists, progress, favourite, delete) via the native UI, including local activity feed entries and the home page's in-progress lists. Optionally syncs the database to a private GitHub repo for cross-device use.
 // @author       john
 // @homepageURL  https://github.com/johnthreekay/anilist-custom-entries
@@ -36,7 +36,7 @@
   const window = (typeof unsafeWindow === 'object' && unsafeWindow) ? unsafeWindow : globalThis;
 
   const TAG = '[AL-Custom]';
-  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.41.3'; } catch (e) { /* diagnostics only */ }
+  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.41.4'; } catch (e) { /* diagnostics only */ }
   const ID_BASE = 2000000000; // far above any real AniList media/entry id, still within GraphQL Int32
   const LS_KEY = 'al-custom-entries-v1';
 
@@ -80,7 +80,14 @@
     return { seq: 0, owners: {}, entries: {}, activities: {}, deleted: {} };
   }
 
-  function saveDB(opts) {
+  // Writes are coalesced: a burst of saveDB calls in one task (bulk import,
+  // merge, a save that touches several records) serializes the database once,
+  // at the end of the task (microtask), never later than that, so nothing is
+  // lost to navigation or tab close. pagehide flushes as a belt and braces.
+  let dbFlushQueued = false;
+  let localChangeSeq = 0; // bumped by every syncing save; the sync compares it
+  function flushDB() {
+    dbFlushQueued = false;
     try { localStorage.setItem(LS_KEY, JSON.stringify(packDB(db))); }
     catch (e) {
       console.warn(TAG, 'failed to save db', e);
@@ -90,8 +97,19 @@
         catch (e2) { /* toast not ready */ }
       }
     }
-    if (!opts || !opts.noSync) scheduleSync();
   }
+  function saveDB(opts) {
+    if (!dbFlushQueued) {
+      dbFlushQueued = true;
+      if (typeof queueMicrotask === 'function') queueMicrotask(flushDB); else Promise.resolve().then(flushDB);
+    }
+    if (!opts || !opts.noSync) {
+      localChangeSeq++;
+      if (!syncCfg.dirty) { syncCfg.dirty = true; saveSyncCfg(); }
+      scheduleSync();
+    }
+  }
+  try { window.addEventListener('pagehide', () => { if (dbFlushQueued) flushDB(); }); } catch (e) { /* ignore */ }
 
   // Database shape version. Every load, import and merge result passes
   // through migrateDB, which fills in fields introduced later (one place
@@ -460,6 +478,18 @@
     return { json: JSON.parse(text), sha: j.sha };
   }
 
+  // Latest commit touching the sync file: a ~1 KB answer that tells whether
+  // the remote moved since the last sync, so page loads skip downloading,
+  // decrypting and merging an unchanged file.
+  async function ghHead() {
+    const path = (syncCfg.path || 'data.json').replace(/^\/+/, '');
+    const url = `https://api.github.com/repos/${syncCfg.repo}/commits?path=${encodeURIComponent(path)}&sha=${encodeURIComponent(syncCfg.branch || 'main')}&per_page=1`;
+    const res = await nativeFetch(url, { headers: ghHeaders(), cache: 'no-store' });
+    if (!res.ok) return null;
+    const j = await res.json();
+    return Array.isArray(j) && j[0] && j[0].sha ? j[0].sha : null;
+  }
+
   async function ghPush(content, sha) {
     const body = {
       message: `alce sync ${new Date().toISOString()}`,
@@ -475,7 +505,7 @@
     if (res.status === 409 || res.status === 422) return { conflict: true };
     if (!res.ok) throw new Error(`GitHub PUT ${res.status}`);
     const j = await res.json();
-    return { sha: j.content && j.content.sha };
+    return { sha: j.content && j.content.sha, commit: j.commit && j.commit.sha };
   }
 
   let syncStatusEl = null;
@@ -501,13 +531,34 @@
     syncTimer = setTimeout(() => syncNow('change'), SYNC_DEBOUNCE_MS);
   }
 
+  // Remember which remote commit the local database matches; local changes
+  // made while the sync ran keep the dirty flag (syncAgain picks them up).
+  async function noteSynced(seqAtPull, commit) {
+    let head = commit;
+    if (!head) { try { head = await ghHead(); } catch (e) { head = null; } }
+    syncCfg.remoteHead = head || null;
+    if (localChangeSeq === seqAtPull) syncCfg.dirty = false;
+    saveSyncCfg();
+  }
+
   async function syncNow(trigger) {
     if (!syncConfigured()) return;
     if (syncing) { syncAgain = true; return; }
     syncing = true;
     setSyncStatus('Syncing…');
     try {
+      // Fast path for the timed syncs: nothing changed here since the last
+      // sync and the remote file's latest commit is the one we synced to →
+      // nothing to pull or push, without touching the file itself.
+      if ((trigger === 'load' || trigger === 'interval') && !syncCfg.dirty && syncCfg.remoteHead) {
+        const head = await ghHead();
+        if (head && head === syncCfg.remoteHead) {
+          setSyncStatus(`In sync (${new Date().toLocaleTimeString()})`);
+          return;
+        }
+      }
       for (let attempt = 0; attempt < 3; attempt++) {
+        const seqAtPull = localChangeSeq;
         const remote = await ghPull();
         let remoteDb = remote.json;
         const remoteEncrypted = isEnvelope(remoteDb);
@@ -543,6 +594,7 @@
             syncKey = null;
             try { await idbSetKey(null); } catch (e) { /* ignore */ }
           }
+          await noteSynced(seqAtPull, null);
           setSyncStatus(`In sync (${new Date().toLocaleTimeString()})${suffix}`);
           return;
         }
@@ -550,6 +602,7 @@
         const body = wantEnc ? JSON.stringify(await sealEnvelope(key, plain), null, 2) : plain;
         const pushed = await ghPush(body, remote.sha);
         if (pushed.conflict) continue; // another device pushed first: re-pull and re-merge
+        await noteSynced(seqAtPull, pushed.commit || null);
         if (dropEncryption) {
           dropEncryption = false;
           syncKey = null;
@@ -692,8 +745,17 @@
     'BASE', 'FORM', 'INPUT', 'BUTTON', 'SELECT', 'TEXTAREA', 'TEMPLATE', 'NOSCRIPT',
     'AUDIO', 'VIDEO', 'SOURCE', 'TRACK', 'SVG', 'MATH']);
 
+  const sanitizeCache = new Map(); // raw html → sanitized (bounded)
   function sanitizeHtml(html) {
     if (typeof html !== 'string' || html.indexOf('<') === -1) return html;
+    const hit = sanitizeCache.get(html);
+    if (hit !== undefined) return hit;
+    const out = sanitizeHtmlUncached(html);
+    if (sanitizeCache.size >= 500) sanitizeCache.delete(sanitizeCache.keys().next().value);
+    sanitizeCache.set(html, out);
+    return out;
+  }
+  function sanitizeHtmlUncached(html) {
     let doc;
     try { doc = new DOMParser().parseFromString(html, 'text/html'); }
     catch (e) { return html.replace(/</g, '&lt;'); }
@@ -3556,6 +3618,17 @@
     const n = addStaffBacklinks(pg.pageData, ents, pg.pageInfo, hits);
     if (n) console.log(TAG, `added ${n} custom role${n === 1 ? '' : 's'} to staff ${meta.id}`);
   }
+  // '<name>-{json}' page keys → their variables (parsed once; the heal runs
+  // every UI tick over the store's page table).
+  const pageKeyVarsCache = new Map();
+  function pageKeyVars(key) {
+    if (pageKeyVarsCache.has(key)) return pageKeyVarsCache.get(key);
+    let v = null;
+    try { v = JSON.parse(key.slice(key.indexOf('{'))); } catch (e) { v = null; }
+    if (pageKeyVarsCache.size >= 300) pageKeyVarsCache.delete(pageKeyVarsCache.keys().next().value);
+    pageKeyVarsCache.set(key, v);
+    return v;
+  }
   // Late injection: repair the store's pages / media entity in place.
   function healBacklinks() {
     const store = vueStore();
@@ -3577,8 +3650,8 @@
       const isStaff = key.indexOf('staffMediaRoles-{') === 0;
       const isStudio = key.indexOf('studioMedia-{') === 0;
       if (!isChar && !isStaff && !isStudio) continue;
-      let v;
-      try { v = JSON.parse(key.slice(key.indexOf('{'))); } catch (e) { continue; }
+      const v = pageKeyVars(key);
+      if (!v) continue;
       const id = parseInt(v && v.id, 10);
       if (!id || isCustomId(id)) continue;
       const pg = ents.page[key];
