@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AniList Custom Entries
 // @namespace    al-custom-entries
-// @version      1.36.2
+// @version      1.37.16
 // @description  Create fully client-side custom anime/manga entries on AniList that behave like normal list entries (rate, note, custom lists, progress, favourite, delete) via the native UI, including local activity feed entries and the home page's in-progress lists. Optionally syncs the database to a private GitHub repo for cross-device use.
 // @author       john
 // @homepageURL  https://github.com/johnthreekay/anilist-custom-entries
@@ -36,7 +36,7 @@
   const window = (typeof unsafeWindow === 'object' && unsafeWindow) ? unsafeWindow : globalThis;
 
   const TAG = '[AL-Custom]';
-  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.36.2'; } catch (e) { /* diagnostics only */ }
+  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.37.16'; } catch (e) { /* diagnostics only */ }
   const ID_BASE = 2000000000; // far above any real AniList media/entry id, still within GraphQL Int32
   const LS_KEY = 'al-custom-entries-v1';
 
@@ -93,10 +93,36 @@
     if (!opts || !opts.noSync) scheduleSync();
   }
 
-  let db = loadDB();
-  db.activities = db.activities || {}; // migration from pre-1.8 databases
-  db.deleted = db.deleted || {}; // migration from pre-1.9 databases (sync tombstones)
-  db.favOrder = db.favOrder || {}; // migration from pre-1.21 databases
+  // Database shape version. Every load, import and merge result passes
+  // through migrateDB, which fills in fields introduced later (one place
+  // instead of `|| {}` guards scattered around) and stamps the version.
+  //   1: pre-1.8 (entries, owners, seq)   2: activities   3: deleted
+  //   4: favOrder                          5: per-record arrays (characters,
+  //   staff, relations, recs, history), media.externalLinks / tags / genres
+  const DB_VERSION = 5;
+  function migrateDB(d) {
+    if (!d || typeof d !== 'object') return d;
+    const from = d.version || 0;
+    if (typeof d.seq !== 'number') d.seq = 0;
+    d.owners = d.owners || {};
+    d.entries = d.entries || {};
+    d.activities = d.activities || {};
+    d.deleted = d.deleted || {};
+    d.favOrder = d.favOrder || {};
+    for (const rec of Object.values(d.entries)) {
+      if (!rec || typeof rec !== 'object') continue;
+      rec.media = rec.media || {};
+      rec.entry = rec.entry || {};
+      for (const k of ['characters', 'staff', 'relations', 'recs', 'history']) if (!Array.isArray(rec[k])) rec[k] = [];
+      for (const k of ['genres', 'tags', 'synonyms', 'externalLinks']) if (!Array.isArray(rec.media[k])) rec.media[k] = [];
+      if (!rec.media.title || typeof rec.media.title !== 'object') rec.media.title = { userPreferred: String(rec.media.title || 'Untitled') };
+    }
+    d.version = DB_VERSION;
+    if (from && from !== DB_VERSION) console.log(TAG, `database migrated ${from} → ${DB_VERSION}`);
+    return d;
+  }
+
+  let db = migrateDB(loadDB());
 
   // Owners that were only learned by browsing someone else's list, never
   // the logged-in account (`self`), owning no entries or activities, are
@@ -159,6 +185,9 @@
   // Wrench-modal toggle: pin custom entries to the top of search results
   // regardless of the sort (off: sort-aware placement). Default off.
   const searchBumpEnabled = () => syncCfg.searchBump === true;
+  // Wrench-modal "Developer options": shows the Debug tab (diagnostics,
+  // RPC logging switch). Default off.
+  const debugEnabled = () => syncCfg.debug === true;
 
   // Timestamps that drive cross-device merging. List-entry saves already
   // bump entry.updatedAt; every other mutation (media edits, characters,
@@ -248,7 +277,26 @@
     const cutoff = nowSec() - 180 * 86400;
     for (const [id, t] of Object.entries(out.deleted)) { if (t < cutoff) delete out.deleted[id]; }
     pruneOwners(out);
-    return out;
+    return migrateDB(out);
+  }
+
+  // What a merge changed locally, for the sync tab's "last pull" report:
+  // records the remote side won or that only it had, and records a remote
+  // tombstone removed. Titles are captured because the losing record is gone.
+  function mergeReport(before, after) {
+    const items = [];
+    const title = (rec) => (rec && rec.media && rec.media.title && rec.media.title.userPreferred) || '#' + (rec && rec.id);
+    for (const [id, rec] of Object.entries(after.entries || {})) {
+      const prev = (before.entries || {})[id];
+      if (!prev) items.push({ id, title: title(rec), kind: 'new' });
+      else if (prev !== rec) items.push({ id, title: title(rec), kind: 'updated' });
+    }
+    for (const [id, rec] of Object.entries(before.entries || {})) {
+      if (!(after.entries || {})[id]) items.push({ id, title: title(rec), kind: 'removed' });
+    }
+    let acts = 0;
+    for (const [id, a] of Object.entries(after.activities || {})) if ((before.activities || {})[id] !== a) acts++;
+    return { at: nowSec(), items: items.slice(0, 50), more: Math.max(0, items.length - 50), activities: acts };
   }
 
   // Key-sorted deep copy so equality checks (and the pushed file) don't
@@ -431,10 +479,12 @@
   function setSyncStatus(msg, isError) {
     syncCfg.lastStatus = msg;
     syncCfg.lastStatusAt = nowSec();
+    syncCfg.lastStatusError = !!isError;
     saveSyncCfg();
     if (syncStatusEl && syncStatusEl.isConnected) {
       syncStatusEl.textContent = msg;
-      syncStatusEl.style.color = isError ? 'rgb(232,93,117)' : '';
+      const row = syncStatusEl.closest('.alce-status-row');
+      if (row) row.dataset.state = isError ? 'bad' : (/^Syncing/.test(msg) ? 'busy' : 'ok');
     }
     console.log(TAG, 'sync:', msg);
   }
@@ -475,6 +525,7 @@
         const mergedCanon = canon(merged);
         const pulledChanges = mergedCanon !== canon(db);
         if (pulledChanges) {
+          try { syncCfg.lastMerge = mergeReport(db, merged); saveSyncCfg(); } catch (e) { /* report only */ }
           db = merged;
           saveDB({ noSync: true });
           try { selfHeal(); } catch (e) { /* best effort */ }
@@ -489,7 +540,7 @@
             syncKey = null;
             try { await idbSetKey(null); } catch (e) { /* ignore */ }
           }
-          setSyncStatus(`In sync${wantEnc ? ' 🔒' : ''} (${new Date().toLocaleTimeString()})${suffix}`);
+          setSyncStatus(`In sync (${new Date().toLocaleTimeString()})${suffix}`);
           return;
         }
         const plain = JSON.stringify(sortDeep(packDB(merged)), null, 2);
@@ -501,7 +552,7 @@
           syncKey = null;
           try { await idbSetKey(null); } catch (e) { /* ignore */ }
         }
-        setSyncStatus(`Synced${wantEnc ? ' 🔒' : ''} (${new Date().toLocaleTimeString()})${suffix}`);
+        setSyncStatus(`Synced (${new Date().toLocaleTimeString()})${suffix}`);
         return;
       }
       setSyncStatus('Sync failed: repeated push conflicts', true);
@@ -4645,14 +4696,127 @@
       cursor: pointer; background: var(--alce-accent, rgb(61,180,242)); }
     .alce-edit-actions-btn .alce-btn-icon { margin: 0; height: 10px; width: 16px; color: #fff; }
   }
-  .alce-overlay { position: fixed; inset: 0; z-index: 2001; background: rgba(0,0,0,.6);
+  /* The site's message toasts (which our toast() uses) get element-ui's
+     running popup z-index, which can end up under our overlays; keep them
+     on top of everything, like the fallback toasts. */
+  .el-message { z-index: 3001 !important; }
+  .alce-overlay { position: fixed; inset: 0; z-index: 2001; background: rgba(0,0,0,.5);
     display: flex; align-items: flex-start; justify-content: center; overflow-y: auto; }
-  .alce-modal { margin: 8vh 20px 40px; width: 560px; max-width: 95vw; border-radius: 6px;
+  /* Modal shell in AniList's dialog idiom: foreground card, a header bar
+     with title + close, an optional tab strip, then a padded body. */
+  /* Same shell as AniList's list editor dialog (measured): a darker header
+     band holding the title, the close cross at top-right and, in the manage
+     modal, the section tabs (media-page nav idiom: active tab is blue), over
+     a foreground-coloured body; 4px radius, the editor's shadow. */
+  .alce-modal { margin: 8vh 20px 40px; width: 640px; max-width: 95vw; border-radius: 4px; overflow: hidden;
     background: rgb(var(--color-foreground, 21 31 46)); color: rgb(var(--color-text, 159 173 189));
-    font-size: 1.3rem; padding: 28px; box-shadow: 0 4px 24px rgba(0,0,0,.5); }
-  .alce-modal-narrow .alce-manage { margin-top: 0; border-top: none; padding-top: 0; }
+    font-size: 1.3rem; padding: 0; box-shadow: 0 2px 33px rgba(0,0,0,.48); }
+  .alce-modal-top { background: rgb(var(--color-foreground-grey, 15 22 31)); position: relative; }
+  .alce-modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+    padding: 24px 56px 20px 24px; }
+  .alce-modal-head h2 { color: rgb(var(--color-text, 159 173 189)); font-size: 1.6rem; margin: 0; font-weight: 500; }
+  .alce-modal-sub { font-size: 1.2rem; color: rgb(var(--color-text-light, 122 133 143)); margin-top: 5px; line-height: 1.5; }
+  .alce-modal-close { position: absolute; top: 14px; right: 16px; border: none; background: transparent;
+    color: rgb(var(--color-text-light, 122 133 143)); font-size: 1.5rem; cursor: pointer; padding: 6px 8px;
+    border-radius: 3px; line-height: 1; transition: color .15s; }
+  .alce-modal-close:hover { color: rgb(var(--color-text, 159 173 189)); }
+  .alce-modal-body { padding: 24px; }
   .alce-modal h2 { color: rgb(var(--color-text, 159 173 189)); font-size: 1.5rem; margin: 0 0 20px;
     font-weight: 600; }
+  .alce-tabs { display: flex; gap: 22px; padding: 0 24px; overflow-x: auto; }
+  .alce-tab { padding: 0 0 12px; font-size: 1.3rem; font-weight: 500; cursor: pointer; white-space: nowrap;
+    color: rgb(var(--color-text-light, 122 133 143)); transition: color .15s; }
+  .alce-tab:hover { color: rgb(var(--color-text, 159 173 189)); }
+  .alce-tab.active { color: var(--alce-accent, rgb(61,180,242)); }
+  .alce-tab-body { padding: 24px; }
+  .alce-section { margin-top: 22px; }
+  .alce-section:first-child { margin-top: 0; }
+  .alce-section-title { font-size: 1.1rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+    color: rgb(var(--color-text-light, 122 133 143)); margin-bottom: 8px; }
+  .alce-section .alce-sync-status { margin-top: 0; }
+  /* Quick-search idiom: dark rounded box, magnifier at the left, 1.5rem
+     semi-bold input on a transparent background. */
+  .alce-search { display: grid; grid-template-columns: 14px auto; align-items: center; gap: 12px;
+    background: rgb(var(--color-background, 11 22 34)); border-radius: 6px; padding: 0 15px; margin-bottom: 14px; }
+  .alce-search svg { width: 14px; height: 14px; color: rgb(var(--color-text-light, 122 133 143)); margin: 0; }
+  .alce-search input { border: none; outline: none; background: transparent; height: 46px; padding: 0; width: 100%;
+    font-size: 1.5rem; font-weight: 600; color: rgb(var(--color-text, 159 173 189)); font-family: inherit; }
+  .alce-search input::placeholder { color: rgb(var(--color-text-light, 122 133 143)); font-weight: 600; }
+  /* Media list (table view) idiom: transparent rows on the foreground card,
+     40px covers in a 60px cell, 1.4rem cells, Status / Type columns, and the
+     whole row turning blue on hover. */
+  .alce-list { max-height: 420px; overflow-y: auto; border-radius: 4px; }
+  .alce-list-head, .alce-list-row { display: flex; align-items: center; font-size: 1.4rem; }
+  .alce-list-head { font-weight: 500; color: rgb(var(--color-text, 159 173 189)); padding: 4px 0 8px; }
+  .alce-list-head .alce-col-status, .alce-list-head .alce-col-type, .alce-list-head .alce-col-progress { color: rgb(var(--color-text, 159 173 189)); }
+  .alce-list-row { cursor: pointer; border-radius: 4px; transition: background-color .15s, color .15s; min-height: 50px; padding: 5px 0; box-sizing: border-box; }
+  .alce-list-row:hover { background: var(--alce-accent, rgb(61,180,242)); color: #fff; }
+  .alce-list-row:hover .alce-list-owner, .alce-list-row:hover .alce-col-status, .alce-list-row:hover .alce-col-type { color: rgba(255,255,255,.85); }
+  .alce-col-cover { flex: none; width: 55px; padding-left: 5px; box-sizing: border-box; }
+  .alce-list-cover { width: 40px; height: 40px; border-radius: 3px;
+    background: rgb(var(--color-background, 11 22 34)) 50% 50% / cover no-repeat; }
+  .alce-col-title { flex: 1; min-width: 0; padding: 0 15px; }
+  /* Long titles wrap onto a second line like the real list's rows do. */
+  .alce-list-title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+    line-height: 1.35; overflow-wrap: anywhere; }
+  .alce-list-owner { font-size: 1.1rem; color: rgb(var(--color-text-light, 122 133 143)); padding-top: 2px; }
+  .alce-col-progress { flex: none; width: 84px; padding: 0 10px; box-sizing: border-box; color: rgb(var(--color-text, 159 173 189)); }
+  .alce-col-status { flex: none; width: 96px; padding: 0 10px; box-sizing: border-box; color: rgb(var(--color-text, 159 173 189)); }
+  .alce-col-type { flex: none; width: 92px; padding: 0 10px; box-sizing: border-box; color: rgb(var(--color-text, 159 173 189)); }
+  .alce-col-actions { flex: none; width: 104px; display: flex; gap: 6px; padding: 0 10px 0 4px; box-sizing: border-box; justify-content: flex-end; }
+  .alce-list-row:hover .alce-col-progress { color: rgba(255,255,255,.85); }
+  /* Row actions: quiet at rest, and their own solid button on hover: pen /
+     download fill with the profile colour (white on an already-highlighted
+     row), the trash fills red. */
+  .alce-list-row .alce-item-act { background: transparent; opacity: 1; color: rgb(var(--color-text-light, 122 133 143)); transition: background-color .15s, color .15s; }
+  .alce-list-row .alce-item-act:hover { color: #fff; background: var(--alce-accent, rgb(61,180,242)); }
+  .alce-list-row:hover .alce-item-act { color: rgba(255,255,255,.9); }
+  .alce-list-row:hover .alce-item-act:hover { color: var(--alce-accent, rgb(61,180,242)); background: #fff; }
+  .alce-list-row .alce-item-del { background: transparent; color: rgb(232,93,117); opacity: 1; transition: background-color .15s, color .15s; }
+  .alce-list-row .alce-item-del:hover, .alce-list-row:hover .alce-item-del:hover { background: rgb(232,93,117); color: #fff; }
+  .alce-list-row:hover .alce-item-del { color: #fff; }
+  @media (max-width: 640px) { .alce-col-status, .alce-col-type, .alce-col-progress { display: none; } }
+  .alce-item-act { width: 26px; height: 26px; border: none; border-radius: 4px; flex-shrink: 0;
+    background: rgb(var(--color-foreground, 21 31 46)); color: rgb(var(--color-text, 159 173 189));
+    cursor: pointer; font-size: 1.3rem; line-height: 1; opacity: .85; }
+  .alce-item-act:hover { opacity: 1; color: var(--alce-accent, rgb(61,180,242)); }
+  .alce-item-act svg { height: 11px; width: 11px; margin: 0; color: inherit; vertical-align: middle; }
+  .alce-section .alce-io-btns + .alce-sync-status { margin-top: 12px; }
+  /* Status card rows: coloured state dot, bold label + message, an optional
+     action button at the right. */
+  .alce-status-card { margin-top: 14px; background: rgb(var(--color-background, 11 22 34)); border-radius: 4px; padding: 4px 14px; }
+  .alce-status-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; font-size: 1.3rem; }
+  .alce-status-row + .alce-status-row { border-top: 1px solid rgba(var(--color-text, 159 173 189), .06); }
+  .alce-status-dot { flex: none; width: 9px; height: 9px; border-radius: 50%; background: rgb(var(--color-text-light, 122 133 143)); }
+  .alce-status-row[data-state="ok"] .alce-status-dot { background: rgb(var(--color-green, 76 202 81)); box-shadow: 0 0 0 3px rgba(76,202,81,.18); }
+  .alce-status-row[data-state="busy"] .alce-status-dot { background: rgb(247,191,99); animation: alce-pulse 1s ease-in-out infinite; }
+  .alce-status-row[data-state="bad"] .alce-status-dot { background: rgb(232,93,117); box-shadow: 0 0 0 3px rgba(232,93,117,.18); }
+  @keyframes alce-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+  .alce-status-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .alce-status-main b { font-weight: 600; color: rgb(var(--color-text, 159 173 189)); }
+  .alce-status-text { font-size: 1.2rem; color: rgb(var(--color-text-light, 122 133 143)); overflow-wrap: anywhere; }
+  .alce-status-row[data-state="bad"] .alce-status-text { color: rgb(232,93,117); }
+  .alce-status-act { flex: none; border: none; border-radius: 4px; height: 30px; padding: 0 12px; min-width: 84px; font-size: 1.2rem; cursor: pointer;
+    background: rgb(var(--color-foreground, 21 31 46)); color: rgb(var(--color-text, 159 173 189)); }
+  .alce-status-act:hover { color: #fff; background: var(--alce-accent, rgb(61,180,242)); }
+  .alce-report { margin-top: 6px; }
+  .alce-report-row { display: flex; gap: 12px; align-items: baseline; padding: 6px 0; font-size: 1.2rem;
+    border-bottom: 1px solid rgba(var(--color-text, 159 173 189), .06); }
+  .alce-report-row:last-child { border-bottom: none; }
+  .alce-report-kind { flex: none; min-width: 130px; color: rgb(var(--color-text-light, 122 133 143)); }
+  .alce-report-row.ok .alce-report-kind { color: rgb(var(--color-green, 76 202 81)); }
+  .alce-report-row.bad .alce-report-kind { color: rgb(232,93,117); }
+  .alce-report-row.removed .alce-report-kind { color: rgb(232,93,117); }
+  .alce-report-row.new .alce-report-kind { color: rgb(var(--color-green, 76 202 81)); }
+  .alce-report-title { min-width: 0; overflow-wrap: anywhere; }
+  .alce-check b { color: rgb(var(--color-text, 159 173 189)); font-weight: 600; }
+  .alce-check-desc { font-size: 1.2rem; color: rgb(var(--color-text-light, 122 133 143)); margin-top: 2px; }
+  .alce-modal-confirm { width: 440px; }
+  .alce-modal-manage { width: 760px; }
+  .alce-confirm-text { font-size: 1.3rem; line-height: 1.5; margin-bottom: 16px; }
+  .alce-btn.alce-danger:disabled { opacity: .45; cursor: default; }
+  .alce-section textarea + .alce-io-btns { margin-top: 10px; }
+  @media (max-width: 640px) { .alce-modal-head, .alce-modal-body, .alce-tab-body { padding-left: 16px; padding-right: 16px; } }
   .alce-field { margin-bottom: 16px; }
   .alce-field label { display: block; font-size: 1.4rem; font-weight: 500; margin-bottom: 8px;
     color: rgb(var(--color-text, 159 173 189)); }
@@ -4676,20 +4840,20 @@
   .alce-char-row .c-img { flex: 3; }
   .alce-char-row button { background: none; border: none; color: rgb(232,93,117); cursor: pointer;
     font-size: 1.2rem; padding: 0 2px; }
-  .alce-add-char { background: rgb(var(--color-background, 11 22 34)); border: none; border-radius: 3px;
-    color: rgb(var(--color-text, 159 173 189)); cursor: pointer; font-size: 1.3rem; padding: 8px 14px; }
+  .alce-add-char { background: rgb(var(--color-background, 11 22 34)); border: none; border-radius: 4px;
+    color: rgb(var(--color-text, 159 173 189)); cursor: pointer; font-size: 1.3rem; padding: 0 16px; height: 36px; }
   .alce-add-char:hover { color: #fff; }
   .alce-row { display: flex; gap: 10px; }
   .alce-row .alce-field { flex: 1; }
   .alce-img-field-row { display: flex; gap: 8px; align-items: stretch; }
   .alce-img-field-row input { flex: 1; min-width: 0; }
-  .alce-embed-btn { flex: none; border: none; border-radius: 3px; padding: 0 12px; cursor: pointer;
-    font-size: 1.2rem; font-weight: 500; color: #fff; background: rgb(var(--color-blue, 61 180 242)); }
+  .alce-embed-btn { flex: none; border: none; border-radius: 4px; padding: 0 14px; cursor: pointer;
+    font-size: 1.3rem; font-weight: 500; color: #fff; background: var(--alce-accent, rgb(61,180,242)); }
   .alce-embed-btn:hover { opacity: .85; }
   .alce-embed-btn:disabled { opacity: .5; cursor: default; }
   .alce-btns { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
-  .alce-btn { border: none; border-radius: 3px; padding: 8px 14px; cursor: pointer; font-size: 1.3rem; }
-  .alce-btn.primary { background: rgb(61,180,242); color: #fff; }
+  .alce-btn { border: none; border-radius: 4px; padding: 0 18px; height: 36px; cursor: pointer; font-size: 1.3rem; font-weight: 500; }
+  .alce-btn.primary { background: var(--alce-accent, rgb(61,180,242)); color: #fff; }
   .alce-btn.primary:hover { opacity: .85; }
   .alce-btn.plain { background: transparent; color: rgb(var(--color-text-light, 122 133 143)); }
   .alce-manage { margin-top: 18px; border-top: 1px solid rgba(255,255,255,.08); padding-top: 14px; }
@@ -4698,15 +4862,21 @@
   .alce-manage-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 1.3rem; }
   .alce-manage-row span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .alce-manage-row button { background: none; border: none; color: rgb(232,93,117); cursor: pointer; font-size: 1.2rem; }
-  .alce-io button, .alce-move button, .alce-sync button, .alce-panel-btns button {
-    background: rgb(var(--color-background, 11 22 34)); border: none; border-radius: 3px;
-    color: rgb(var(--color-text, 159 173 189)); cursor: pointer; font-size: 1.2rem; padding: 7px 12px; }
+  .alce-io button, .alce-move button, .alce-sync button, .alce-panel-btns button, .alce-section .alce-io-btns button {
+    background: rgb(var(--color-background, 11 22 34)); border: none; border-radius: 4px;
+    color: rgb(var(--color-text, 159 173 189)); cursor: pointer; font-size: 1.3rem; padding: 0 16px; height: 36px; }
   .alce-io button:hover, .alce-move button:hover, .alce-sync button:hover,
-  .alce-panel-btns button:hover { color: #fff; }
-  .alce-io button.blue, .alce-move button.blue, .alce-sync button.blue, .alce-panel-btns button.blue {
-    background: rgb(61,180,242); color: #fff; }
+  .alce-panel-btns button:hover, .alce-section .alce-io-btns button:hover { color: #fff; }
+  .alce-io button.blue, .alce-move button.blue, .alce-sync button.blue, .alce-panel-btns button.blue,
+  .alce-section .alce-io-btns button.blue { background: var(--alce-accent, rgb(61,180,242)); color: #fff; }
   .alce-io button.blue:hover, .alce-move button.blue:hover, .alce-sync button.blue:hover,
-  .alce-panel-btns button.blue:hover { opacity: .85; }
+  .alce-panel-btns button.blue:hover, .alce-section .alce-io-btns button.blue:hover { opacity: .85; }
+  .alce-section .alce-io-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+  .alce-section .alce-io-btns button:disabled { opacity: .6; cursor: default; }
+  .alce-section .alce-io-btns button.alce-danger { background: rgb(232,93,117); color: #fff; }
+  .alce-section textarea { width: 100%; box-sizing: border-box; height: 72px; border: none; border-radius: 4px;
+    background: rgb(var(--color-background, 11 22 34)); color: rgb(var(--color-text, 159 173 189));
+    padding: 8px 10px; font-size: 1.2rem; margin-top: 10px; display: none; font-family: monospace; }
   .alce-panel-btns { display: flex; gap: 10px; margin-top: 4px; }
   .alce-edit-panel { margin-bottom: 25px; font-size: 1.3rem; color: rgb(var(--color-text, 159 173 189)); }
   .alce-edit-panel h2 { font-size: 1.4rem; font-weight: 500; margin: 0 0 10px;
@@ -4732,8 +4902,8 @@
     background: rgb(232,93,117); color: #fff; cursor: pointer; opacity: .85; }
   .alce-item-del:hover { opacity: 1; }
   .alce-item-del svg { height: 11px; width: 11px; margin: 0; color: #fff; vertical-align: middle; }
-  button.alce-danger { background: rgb(232,93,117); color: #fff; border: none; border-radius: 3px;
-    padding: 8px 14px; font-size: 1.3rem; cursor: pointer; }
+  button.alce-danger { background: rgb(232,93,117); color: #fff; border: none; border-radius: 4px;
+    padding: 0 16px; height: 36px; font-size: 1.3rem; cursor: pointer; }
   button.alce-danger:hover { opacity: .9; color: #fff; }
   .alce-hinted { cursor: help; }
   .alce-toasts { position: fixed; top: 74px; left: 50%; transform: translateX(-50%);
@@ -4785,11 +4955,11 @@
   .alce-import-err { color: rgb(232,93,117); font-size: 1.1rem; padding: 2px 4px; }
   .alce-import-status { font-size: 1.1rem; color: rgb(var(--color-text-light, 122 133 143)); margin-top: 4px; }
   .alce-covers { margin: -8px 0 16px; }
-  .alce-cover-btn { background: rgb(var(--color-background, 11 22 34)); border: none; border-radius: 3px;
+  .alce-cover-btn { background: rgb(var(--color-background, 11 22 34)); border: none; border-radius: 4px;
     color: rgb(var(--color-text, 159 173 189)); cursor: pointer;
-    font-size: 1.2rem; padding: 7px 12px; margin-right: 10px; }
+    font-size: 1.3rem; padding: 0 16px; height: 36px; margin-right: 10px; }
   .alce-cover-btn:hover { color: #fff; }
-  .alce-cover-lang { border: none; border-radius: 3px; padding: 6px 26px 6px 10px; font-size: 1.2rem;
+  .alce-cover-lang { border: none; border-radius: 4px; padding: 0 26px 0 12px; height: 36px; font-size: 1.3rem;
     color: rgb(var(--color-text, 159 173 189)); background-color: rgb(var(--color-background, 11 22 34)); }
   .alce-cover-grid { display: flex; flex-wrap: wrap; gap: 8px; max-height: 240px; overflow-y: auto; margin-top: 8px; }
   .alce-cover-cell { width: 72px; cursor: pointer; text-align: center; }
@@ -4954,6 +5124,20 @@
     d: 'M32 0h304l138 132a16 16 0 0 1 0 24L336 288H32a32 32 0 0 1-32-32V32A32 32 0 0 1 32 0z',
   };
 
+  // Font Awesome 5 free-solid fa-search (CC BY 4.0), the quick search's icon.
+  const ICON_SEARCH = {
+    viewBox: '0 0 512 512',
+    d: 'M505 442.7L405.3 343c-4.5-4.5-10.6-7-17-7H372c27.6-35.3 44-79.7 44-128C416 93.1 322.9 0 208 0S0 93.1 0 208s93.1 208 208 208c48.3 0 92.7-16.4 128-44v16.3c0 6.4 2.5 12.5 7 17l99.7 99.7c9.4 9.4 24.6 9.4 33.9 0l28.3-28.3c9.4-9.4 9.4-24.6.1-34zM208 336c-70.7 0-128-57.2-128-128 0-70.7 57.2-128 128-128 70.7 0 128 57.2 128 128 0 70.7-57.2 128-128 128z',
+  };
+  // Font Awesome 5 free-solid fa-pen and fa-download (CC BY 4.0).
+  const ICON_PEN = {
+    viewBox: '0 0 512 512',
+    d: 'M290.74 93.24l128.02 128.02-277.99 277.99-114.14 12.6C11.35 513.54-1.56 500.62.14 485.34l12.7-114.22 277.9-277.88zm207.2-19.06l-60.11-60.11c-18.75-18.75-49.16-18.75-67.91 0l-56.55 56.55 128.02 128.02 56.55-56.55c18.75-18.76 18.75-49.16 0-67.91z',
+  };
+  const ICON_DOWNLOAD = {
+    viewBox: '0 0 512 512',
+    d: 'M216 0h80c13.3 0 24 10.7 24 24v168h87.7c17.8 0 26.7 21.5 14.1 34.1L269.7 378.3c-7.5 7.5-19.8 7.5-27.3 0L90.1 226.1c-12.6-12.6-3.7-34.1 14.1-34.1H192V24c0-13.3 10.7-24 24-24zm296 376v112c0 13.3-10.7 24-24 24H24c-13.3 0-24-10.7-24-24V376c0-13.3 10.7-24 24-24h146.7l49 49c20.1 20.1 52.5 20.1 72.6 0l49-49H488c13.3 0 24 10.7 24 24zm-124 88c0-11-9-20-20-20s-20 9-20 20 9 20 20 20 20-9 20-20zm64 0c0-11-9-20-20-20s-20 9-20 20 9 20 20 20 20-9 20-20z',
+  };
   // Font Awesome free-solid fa-trash (CC BY 4.0).
   const ICON_TRASH = {
     viewBox: '0 0 448 512',
@@ -5138,7 +5322,7 @@
       importTimer = setTimeout(runImportSearch, 450);
     });
 
-    const root = el('div', { class: 'alce-import' }, field(`Search ${sources}`, input), statusEl, results);
+    const root = el('div', { class: 'alce-import' }, field(type === 'ANIME' ? 'Search database' : 'Search databases', input), statusEl, results);
     return { root, setStatus: api.setStatus };
   }
 
@@ -6072,9 +6256,11 @@
         if (imported === r) ui.setStatus(base + ` Characters failed: ${e.message}`);
       }
     });
-    const overlay = el('div', { class: 'alce-overlay', onclick: (e) => { if (e.target === overlay) overlay.remove(); } },
-      el('div', { class: 'alce-modal' },
-        el('h2', {}, `Add Custom ${anime ? 'Anime' : 'Manga'} Entry`),
+    const overlay = el('div', { class: 'alce-overlay', onclick: (e) => { if (e.target === overlay) overlay.remove(); } });
+    overlay.appendChild(el('div', { class: 'alce-modal alce-modal-create' },
+      el('div', { class: 'alce-modal-top' },
+        modalHead(`Add Custom ${anime ? 'Anime' : 'Manga'} Entry`, overlay, 'Pick an import result to fill the form, or type everything by hand. Nothing is saved until Create.')),
+      el('div', { class: 'alce-modal-body' },
         search.root,
         field('Title', title),
         el('div', { class: 'alce-row' }, field('Format', format), field('List Status', status)),
@@ -6138,23 +6324,40 @@
           }, 'Create'),
         ),
       ),
-    );
+    ));
     document.body.appendChild(overlay);
     title.focus();
   }
 
-  // Manage/settings modal (gear button): entries, account move, export/import
-  // and GitHub sync. Entry rows navigate to the native submission editor.
+  // Manage modal (wrench button), laid out like AniList's own dialogs: a
+  // header bar, a tab strip (Entries · Sync · Images · Settings, plus Debug
+  // when developer options are on) and one section per tab.
+  let manageTab = 'entries';
   function openManageModal() {
-    const manage = el('div', { class: 'alce-manage' });
-    const overlay = el('div', { class: 'alce-overlay', onclick: (e) => { if (e.target === overlay) overlay.remove(); } },
-      el('div', { class: 'alce-modal alce-modal-narrow' },
-        el('h2', {}, 'Custom Entries'),
-        manage,
-      ),
+    const body = el('div', { class: 'alce-tab-body' });
+    const overlay = el('div', { class: 'alce-overlay', onclick: (e) => { if (e.target === overlay) overlay.remove(); } });
+    const tabs = el('div', { class: 'alce-tabs' });
+    const modal = el('div', { class: 'alce-modal alce-modal-manage' },
+      el('div', { class: 'alce-modal-top' },
+        modalHead('Custom Entries', overlay, () => `${allRecs().length} entr${allRecs().length === 1 ? 'y' : 'ies'} · v${window.__ALCE_VERSION || ''}`),
+        tabs),
+      body,
     );
-    renderManage(manage, overlay);
+    overlay.appendChild(modal);
+    const render = () => renderManage(body, overlay, tabs, render);
+    render();
     document.body.appendChild(overlay);
+  }
+
+  // Shared modal header: title, optional subtitle, close button.
+  function modalHead(title, overlay, subtitle) {
+    const sub = typeof subtitle === 'function' ? subtitle() : subtitle;
+    return el('div', { class: 'alce-modal-head' },
+      el('div', { class: 'alce-modal-titles' },
+        el('h2', {}, title),
+        ...(sub ? [el('div', { class: 'alce-modal-sub' }, sub)] : [])),
+      el('button', { class: 'alce-modal-close', title: 'Close', onclick: () => overlay.remove() }, '✕'),
+    );
   }
 
   // Reassign every custom entry and activity (plus the previous owner's
@@ -6179,132 +6382,195 @@
     return moved;
   }
 
-  function renderManage(container, overlay) {
+  // One entry (plus its activities) as an importable database slice.
+  function exportSlice(recs) {
+    const ids = new Set(recs.map((r) => r.id));
+    const out = { version: DB_VERSION, seq: db.seq, owners: {}, entries: {}, activities: {}, deleted: {}, favOrder: {} };
+    for (const r of recs) { out.entries[r.id] = r; if (db.owners[r.ownerId]) out.owners[r.ownerId] = db.owners[r.ownerId]; }
+    for (const [id, a] of Object.entries(db.activities)) if (ids.has(a.mediaId)) out.activities[id] = a;
+    return JSON.stringify(packDB(out));
+  }
+
+  const timeAgo = (t) => {
+    const d = Math.max(0, nowSec() - t);
+    if (d < 60) return 'just now';
+    if (d < 3600) return `${Math.floor(d / 60)} min ago`;
+    if (d < 86400) return `${Math.floor(d / 3600)} h ago`;
+    return `${Math.floor(d / 86400)} d ago`;
+  };
+
+  function renderManage(container, overlay, tabsEl, rerender) {
     container.textContent = '';
-    const recs = allRecs();
-    const multiOwner = Object.keys(db.owners).length > 1;
-    container.appendChild(el('div', { class: 'alce-sync-status' },
-      recs.length ? `${recs.length} ${recs.length === 1 ? 'entry' : 'entries'} · click one to edit it on the native editor` : 'No custom entries yet.'));
-    for (const rec of recs) {
-      const ownerName = multiOwner ? ' · ' + ((db.owners[rec.ownerId] || {}).name || rec.ownerId) : '';
-      const cover = el('div', { class: 'alce-item-cover' });
-      const cu = rec.media.coverImage && (rec.media.coverImage.medium || rec.media.coverImage.large);
-      if (cu && cu !== DEFAULT_COVER) cover.style.backgroundImage = 'url("' + String(cu).replace(/"/g, '') + '")';
-      container.appendChild(el('div', { class: 'alce-item-row link', onclick: () => location.assign(editHref(rec)) },
-        cover,
-        el('div', { class: 'alce-item-text' },
-          el('div', { class: 'alce-item-title' }, rec.media.title.userPreferred),
-          el('div', { class: 'alce-item-sub' },
-            [rec.type === 'ANIME' ? 'Anime' : 'Manga', rec.entry.status || 'Not on a list']
-              .join(' · ') + ownerName)),
-        el('button', {
-          class: 'alce-item-del',
-          title: 'Delete',
-          onclick: (e) => {
-            e.stopPropagation();
-            markDeleted(rec.id);
-            delete db.entries[rec.id];
-            deleteActivitiesFor(rec);
-            saveDB();
-            syncSections(rec, true);
-            syncHomePreview(rec, true);
-            const store = vueStore();
-            if (store) store.commit('deleteEntity', { type: 'listEntry', id: rec.entry.id });
-            renderManage(container, overlay);
-            toast(`Deleted "${rec.media.title.userPreferred}"`);
-          },
-        }, svgIcon(ICON_TRASH)),
-      ));
+    const TABS = [['entries', 'Entries'], ['sync', 'Sync'], ['images', 'Images'], ['settings', 'Settings']];
+    if (debugEnabled()) TABS.push(['debug', 'Debug']);
+    if (!TABS.some(([k]) => k === manageTab)) manageTab = 'entries';
+    if (tabsEl) {
+      tabsEl.textContent = '';
+      for (const [key, label] of TABS) {
+        tabsEl.appendChild(el('div', {
+          class: 'alce-tab' + (manageTab === key ? ' active' : ''),
+          onclick: () => { manageTab = key; rerender(); },
+        }, label));
+      }
     }
-    if (recs.length) {
-      const selfOwners = Object.values(db.owners).filter((o) => o.self);
-      const ownerSel = select(selfOwners.map((o) => [String(o.id), o.name || String(o.id)]), null);
-      container.appendChild(el('div', { class: 'alce-move' },
-        el('div', {
-          class: 'alce-manage-title alce-hinted',
-          title: 'Moves every custom entry and its activities to the selected account. Only accounts you\'ve been logged into are listed; log into the other account and open its anime or manga list once to add it here.',
-        }, 'Move to Another Account'),
-        ...(selfOwners.length ? [
-          field('Account', ownerSel),
-          el('div', { class: 'alce-io-btns' },
+    const section = (title, ...children) => el('div', { class: 'alce-section' },
+      ...(title ? [el('div', { class: 'alce-section-title' }, title)] : []), ...children);
+    const hint = (text) => el('div', { class: 'alce-sync-status' }, text);
+    const btnRow = (...btns) => el('div', { class: 'alce-io-btns' }, ...btns);
+
+    if (manageTab === 'entries') renderEntriesTab(container, overlay, rerender, section, hint, btnRow);
+    else if (manageTab === 'sync') renderSyncTab(container, rerender, section, hint, btnRow);
+    else if (manageTab === 'images') renderImagesTab(container, section, hint, btnRow);
+    else if (manageTab === 'settings') renderSettingsTab(container, rerender, section, hint, btnRow);
+    else if (manageTab === 'debug') renderDebugTab(container, section, hint, btnRow);
+  }
+
+  /* --- Entries tab: filterable list with per-row edit / export / delete. --- */
+  async function copyText(text, okMsg) {
+    try { await navigator.clipboard.writeText(text); toast(okMsg || 'Copied to clipboard'); }
+    catch (e) { toast('Copy failed (clipboard blocked by the browser)', true); }
+  }
+  function renderEntriesTab(container, overlay, rerender, section, hint, btnRow) {
+    const listOwner = syncCfg.listOwner; // 'all' or an owner id (Settings › Accounts)
+    const recs = allRecs().filter((r) => !listOwner || listOwner === 'all' || String(r.ownerId) === String(listOwner))
+      .slice().sort((a, b) => recTime(b) - recTime(a));
+    // Search box in the quick search's idiom, list in the media list's
+    // table idiom (40px cover cell, title, Status / Type columns, whole row
+    // turns blue on hover), plus the row actions.
+    const filter = el('input', { type: 'text', placeholder: recs.length ? `Search ${recs.length} entr${recs.length === 1 ? 'y' : 'ies'}` : 'No custom entries yet', spellcheck: 'false' });
+    const searchBox = el('div', { class: 'alce-search' }, svgIcon(ICON_SEARCH), filter);
+    const list = el('div', { class: 'alce-list' });
+    const renderList = () => {
+      list.textContent = '';
+      const q = normText(filter.value);
+      const shown = recs.filter((rec) => !q || recSearchTitles(rec).some((t) => t.includes(q)));
+      if (shown.length) {
+        list.appendChild(el('div', { class: 'alce-list-head' },
+          el('div', { class: 'alce-col-cover' }),
+          el('div', { class: 'alce-col-title' }, 'Title'),
+          el('div', { class: 'alce-col-progress' }, 'Progress'),
+          el('div', { class: 'alce-col-status' }, 'Status'),
+          el('div', { class: 'alce-col-type' }, 'Type'),
+          el('div', { class: 'alce-col-actions' })));
+      }
+      for (const rec of shown) {
+        const total = rec.type === 'ANIME' ? rec.media.episodes : rec.media.chapters;
+        const progress = rec.entry.status ? `${rec.entry.progress || 0}${total ? '/' + total : ''}` : '';
+        const cover = el('div', { class: 'alce-list-cover' });
+        const cu = rec.media.coverImage && (rec.media.coverImage.medium || rec.media.coverImage.large);
+        if (cu && cu !== DEFAULT_COVER) cover.style.backgroundImage = 'url("' + String(cu).replace(/"/g, '') + '")';
+        const status = rec.entry.status ? ((STATUS_OPTS(rec.type === 'ANIME').find((o) => o[0] === rec.entry.status) || [])[1] || rec.entry.status) : 'Not on a list';
+        const type = FMT_LABEL[rec.media.format] || rec.media.format || (rec.type === 'ANIME' ? 'Anime' : 'Manga');
+        list.appendChild(el('div', { class: 'alce-list-row', onclick: () => location.assign(mediaHref(rec)) },
+          el('div', { class: 'alce-col-cover' }, cover),
+          el('div', { class: 'alce-col-title' },
+            el('div', { class: 'alce-list-title' }, rec.media.title.userPreferred)),
+          el('div', { class: 'alce-col-progress' }, progress),
+          el('div', { class: 'alce-col-status' }, status),
+          el('div', { class: 'alce-col-type' }, type),
+          el('div', { class: 'alce-col-actions' },
             el('button', {
-              class: 'blue',
-              onclick: () => {
-                const targetId = parseInt(ownerSel.value, 10);
-                const target = db.owners[targetId];
-                if (!target) return;
-                const moved = migrateAllTo(targetId);
-                renderManage(container, overlay);
-                if (moved) toast(`Moved ${moved} entr${moved === 1 ? 'y' : 'ies'} to ${target.name}. Reload to see them there.`);
-                else toast(`Everything already belongs to ${target.name}`, true);
-              },
-            }, 'Move All'),
-          ),
-        ] : []),
-      ));
-    }
-
-    const ta = el('textarea', { spellcheck: 'false' });
-    container.appendChild(el('div', { class: 'alce-io' },
-      el('div', { class: 'alce-io-btns' },
-        el('button', {
-          onclick: () => {
-            ta.style.display = 'block';
-            ta.value = JSON.stringify(packDB(db));
-            ta.select();
-          },
-        }, 'Export'),
-        el('button', {
-          onclick: () => {
-            if (ta.style.display !== 'block') { ta.style.display = 'block'; ta.value = ''; ta.placeholder = 'Paste export JSON here, then press Import again'; ta.focus(); return; }
-            try {
-              const parsed = unpackDB(JSON.parse(ta.value));
-              if (parsed && parsed.entries) {
-                db = parsed;
-                db.activities = db.activities || {};
-                db.deleted = db.deleted || {};
-                db.favOrder = db.favOrder || {};
+              class: 'alce-item-act', title: 'Edit',
+              onclick: (e) => { e.stopPropagation(); location.assign(editHref(rec)); },
+            }, svgIcon(ICON_PEN)),
+            el('button', {
+              class: 'alce-item-act', title: 'Copy as JSON',
+              onclick: (e) => { e.stopPropagation(); copyText(exportSlice([rec]), `Copied "${rec.media.title.userPreferred}" as JSON`); },
+            }, svgIcon(ICON_DOWNLOAD)),
+            el('button', {
+              class: 'alce-item-del',
+              title: 'Delete',
+              onclick: (e) => {
+                e.stopPropagation();
+                markDeleted(rec.id);
+                delete db.entries[rec.id];
+                deleteActivitiesFor(rec);
                 saveDB();
-                renderManage(container, overlay);
-                toast('Database imported. Reload the page.');
-              }
-            } catch (e) { toast('Invalid JSON', true); }
-          },
-        }, 'Import'),
-      ),
-      ta,
-    ));
+                syncSections(rec, true);
+                syncHomePreview(rec, true);
+                const store = vueStore();
+                if (store) store.commit('deleteEntity', { type: 'listEntry', id: rec.entry.id });
+                rerender();
+                toast(`Deleted "${rec.media.title.userPreferred}"`);
+              },
+            }, svgIcon(ICON_TRASH))),
+        ));
+      }
+      if (!shown.length) list.appendChild(hint(recs.length ? 'No entry matches.' : 'Press + on your anime or manga list to create one.'));
+    };
+    filter.addEventListener('input', renderList);
+    renderList();
+    container.appendChild(section(null, searchBox, list));
+  }
 
+  // GitHub-style confirmation: the action button only arms once the word is
+  // typed. Resolves true when confirmed, false when dismissed.
+  function confirmModal(opts) {
+    return new Promise((resolve) => {
+      const word = opts.word || 'confirm';
+      const overlay = el('div', { class: 'alce-overlay', onclick: (e) => { if (e.target === overlay) { overlay.remove(); resolve(false); } } });
+      const input = el('input', { type: 'text', placeholder: word, spellcheck: 'false', autocomplete: 'off' });
+      const go = el('button', { class: 'alce-btn alce-danger', disabled: 'disabled' }, opts.actionLabel || 'Confirm');
+      input.addEventListener('input', () => { if (input.value.trim().toLowerCase() === word) go.removeAttribute('disabled'); else go.setAttribute('disabled', 'disabled'); });
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !go.hasAttribute('disabled')) go.click(); if (e.key === 'Escape') { overlay.remove(); resolve(false); } });
+      go.addEventListener('click', () => { if (go.hasAttribute('disabled')) return; overlay.remove(); resolve(true); });
+      overlay.appendChild(el('div', { class: 'alce-modal alce-modal-confirm' },
+        el('div', { class: 'alce-modal-top' }, modalHead(opts.title || 'Are you sure?', overlay)),
+        el('div', { class: 'alce-modal-body' },
+          el('div', { class: 'alce-confirm-text' }, opts.message || ''),
+          el('div', { class: 'alce-field' }, el('label', {}, `Type '${word}' to continue`), input),
+          el('div', { class: 'alce-btns' },
+            el('button', { class: 'alce-btn plain', onclick: () => { overlay.remove(); resolve(false); } }, 'Cancel'),
+            go)),
+      ));
+      overlay.querySelector('.alce-modal-close').addEventListener('click', () => resolve(false));
+      document.body.appendChild(overlay);
+      input.focus();
+    });
+  }
+
+  /* --- Sync tab: GitHub sync, encryption, last pull report. --- */
+  function renderSyncTab(container, rerender, section, hint, btnRow) {
     const repoIn = el('input', { type: 'text', placeholder: 'user/repo (private)', spellcheck: 'false' });
     repoIn.value = syncCfg.repo || '';
     const tokIn = el('input', { type: 'password', placeholder: 'Fine-grained token (Contents: read & write on that repo only)' });
     tokIn.value = syncCfg.token || '';
     const passIn = el('input', { type: 'password', placeholder: 'Never stored. Use the same passphrase on every device.' });
-    const status = el('div', { class: 'alce-sync-status' },
+    // Status card: a sync row (state dot, message, Sync now) and an
+    // encryption row (lock, state, Disable), instead of two lines of text.
+    const statusText = el('span', { class: 'alce-status-text' },
       syncConfigured() ? (syncCfg.lastStatus || 'Configured, not synced yet') : 'Not configured');
-    syncStatusEl = status;
-    const encStatus = el('div', { class: 'alce-sync-status' });
-    const disableBtn = el('button', { style: 'display:none' }, 'Disable Encryption');
+    syncStatusEl = statusText;
+    const syncRow = el('div', { class: 'alce-status-row', 'data-state': !syncConfigured() ? 'off' : (syncCfg.lastStatusError ? 'bad' : (syncCfg.lastStatus ? 'ok' : 'off')) },
+      el('span', { class: 'alce-status-dot' }),
+      el('div', { class: 'alce-status-main' }, el('b', {}, 'Sync'), statusText));
+    const encText = el('span', { class: 'alce-status-text' }, 'Checking…');
+    const disableBtn = el('button', { class: 'alce-status-act', style: 'display:none' }, 'Disable');
+    const encRow = el('div', { class: 'alce-status-row', 'data-state': 'off' },
+      el('span', { class: 'alce-status-dot' }),
+      el('div', { class: 'alce-status-main' }, el('b', {}, 'Encryption'), encText),
+      disableBtn);
     const refreshEnc = async () => {
       let on = !!syncKey;
       if (!on) { try { on = !!(await idbGetKey()); } catch (e) { /* ignore */ } }
-      encStatus.textContent = on
-        ? 'Encryption enabled (AES-256-GCM)'
-        : 'Encryption off. Set a passphrase to encrypt synced data.';
+      encText.textContent = on ? 'On · AES-256-GCM, key kept in this browser' : 'Off · set a passphrase above and press Save & Sync Now';
+      encRow.dataset.state = on ? 'ok' : 'off';
       disableBtn.style.display = on ? '' : 'none';
     };
+    const finish = () => { refreshEnc(); if (syncCfg.lastStatus) toast(syncCfg.lastStatus, !!syncCfg.lastStatusError); };
     disableBtn.addEventListener('click', () => {
       dropEncryption = true;
-      syncNow('manual').then(refreshEnc);
+      syncNow('manual').then(finish);
     });
+    const syncNowBtn = el('button', { class: 'alce-status-act', onclick: () => { if (!syncConfigured()) { toast('Configure the repository and token first', true); return; } syncNow('manual').then(finish); } }, 'Sync now');
+    syncRow.appendChild(syncNowBtn);
     refreshEnc();
-    container.appendChild(el('div', { class: 'alce-sync' },
-      el('div', { class: 'alce-manage-title' }, 'GitHub Sync (optional)'),
-      el('div', { class: 'alce-sync-status' }, 'The token is stored in this browser\'s localStorage.'),
+    container.appendChild(section('GitHub sync',
+      hint('One JSON file in a private repo, pushed on every change and merged on every page load. The token stays in this browser.'),
       field('Repository', repoIn),
       field('Access token', tokIn),
       field('Encryption passphrase (optional)', passIn),
-      el('div', { class: 'alce-io-btns' },
+      btnRow(
         el('button', {
           class: 'blue',
           onclick: () => {
@@ -6316,25 +6582,45 @@
               passIn.value = '';
               dropEncryption = false;
             }
-            if (syncConfigured()) syncNow('manual').then(refreshEnc);
-            else setSyncStatus('Not configured');
+            if (syncConfigured()) syncNow('manual').then(finish);
+            else { setSyncStatus('Not configured'); syncRow.dataset.state = 'off'; }
           },
         }, 'Save & Sync Now'),
-        disableBtn,
       ),
-      encStatus,
-      status,
+      el('div', { class: 'alce-status-card' }, syncRow, encRow),
     ));
 
-    // --- image host (self-hosted al-custom-entry-images) ---
+    // Last pull report: which records the merge took from the other side.
+    const rep = syncCfg.lastMerge;
+    const KIND = { new: 'added from remote', updated: 'remote version won', removed: 'deleted on remote' };
+    container.appendChild(section('Last pull',
+      ...(rep && rep.at ? [
+        hint(`${timeAgo(rep.at)}: ${rep.items.length + (rep.more || 0)} entr${rep.items.length + (rep.more || 0) === 1 ? 'y' : 'ies'} changed${rep.activities ? `, ${rep.activities} activit${rep.activities === 1 ? 'y' : 'ies'}` : ''}.`),
+        ...(rep.items.length ? [el('div', { class: 'alce-report' },
+          ...rep.items.map((it) => el('div', { class: 'alce-report-row ' + it.kind },
+            el('span', { class: 'alce-report-kind' }, KIND[it.kind] || it.kind),
+            el('span', { class: 'alce-report-title' }, it.title))),
+          ...(rep.more ? [hint(`… and ${rep.more} more`)] : []))] : []),
+      ] : [hint('No pull has changed anything yet on this device.')]),
+    ));
+  }
+
+  /* --- Images tab: image host + migration of embedded images. --- */
+  function renderImagesTab(container, section, hint, btnRow) {
     const imgHostIn = el('input', { type: 'text', placeholder: 'https://sync.manga.example.com', spellcheck: 'false' });
     imgHostIn.value = syncCfg.imgHost || '';
     const imgTokIn = el('input', { type: 'password', placeholder: 'UPLOAD_TOKEN of the image host' });
     imgTokIn.value = syncCfg.imgToken || '';
+    let embedded = 0;
+    let embeddedBytes = 0;
+    for (const rec of allRecs()) {
+      const md = rec.media || {};
+      for (const u of [md.coverImage && md.coverImage.large, md.bannerImage]) if (isDataUrl(u)) { embedded++; embeddedBytes += String(u).length; }
+    }
     const imgStatus = el('div', { class: 'alce-sync-status' }, imgHostConfigured()
       ? 'Configured. Images that cannot be hotlinked are uploaded there instead of embedded.'
       : 'Not configured: images that cannot be hotlinked are embedded as data: URIs (they count against the ~5 MB localStorage quota).');
-    const migrateBtn = el('button', {}, 'Upload embedded images');
+    const migrateBtn = el('button', {}, `Upload embedded images${embedded ? ` (${embedded}, ${Math.round(embeddedBytes / 1024)} KB)` : ''}`);
     let migrating = false;
     migrateBtn.addEventListener('click', async () => {
       if (migrating) return;
@@ -6370,13 +6656,11 @@
       migrating = false;
       migrateBtn.disabled = false;
     });
-    container.appendChild(el('div', { class: 'alce-sync' },
-      el('div', { class: 'alce-manage-title' }, 'Image host (optional)'),
-      el('div', { class: 'alce-sync-status' },
-        'A self-hosted al-custom-entry-images server. Uploaded images are public at unguessable hash URLs; the token is stored in this browser\'s localStorage.'),
+    container.appendChild(section('Image host',
+      hint('A self-hosted al-custom-entry-images server for covers that cannot be hotlinked. Uploads are public at unguessable URLs.'),
       field('Base URL', imgHostIn),
       field('Upload token', imgTokIn),
-      el('div', { class: 'alce-io-btns' },
+      btnRow(
         el('button', {
           class: 'blue',
           onclick: async () => {
@@ -6401,24 +6685,117 @@
       ),
       imgStatus,
     ));
+  }
 
-    // --- danger zone ---
+  /* --- Settings tab: toggles, account move, export / import, danger zone. --- */
+  function renderSettingsTab(container, rerender, section, hint, btnRow) {
+    const toggle = (label, text, get, set) => {
+      const chk = el('input', { type: 'checkbox' });
+      chk.checked = get();
+      chk.onchange = () => set(chk.checked);
+      return el('label', { class: 'alce-check' }, chk, el('span', {}, el('b', {}, label), el('div', { class: 'alce-check-desc' }, text)));
+    };
+    container.appendChild(section('Behavior',
+      toggle('Profile statistics', 'Count custom entries in your profile statistics, the Stats pages and the Activity History heatmap.',
+        statsBumpEnabled, (on) => { syncCfg.statsBump = on; saveSyncCfg(); toast(on ? 'Custom entries now count in your profile statistics (reload the profile to see it)' : 'Custom entries no longer count in your profile statistics (reload the profile to see it)'); }),
+      toggle('Search on top', 'Pin custom entries to the top of search results whatever the sort. Off: they sort like real entries (last under popularity, trending, score and favourites).',
+        searchBumpEnabled, (on) => { syncCfg.searchBump = on; saveSyncCfg(); toast(on ? 'Custom entries now sit on top of search results' : 'Custom entries now follow the search sort'); }),
+      toggle('Developer options', 'Show the Debug tab.',
+        debugEnabled, (on) => { syncCfg.debug = on; saveSyncCfg(); if (!on && manageTab === 'debug') manageTab = 'settings'; rerender(); }),
+    ));
+
+    const recs = allRecs();
+    const owners = Object.values(db.owners);
+    if (owners.length > 1) {
+      const counts = {};
+      for (const r of recs) counts[r.ownerId] = (counts[r.ownerId] || 0) + 1;
+      const showSel = select([['all', `All accounts (${recs.length})`]].concat(owners.map((o) => [String(o.id), `${o.name || o.id} (${counts[o.id] || 0})`])), syncCfg.listOwner || 'all');
+      showSel.addEventListener('change', () => { syncCfg.listOwner = showSel.value; saveSyncCfg(); toast(showSel.value === 'all' ? 'Entries tab shows every account' : `Entries tab shows ${(db.owners[showSel.value] || {}).name || showSel.value}'s entries`); });
+      container.appendChild(section('Accounts',
+        hint('Custom entries belong to the account they were created from. Choose which account the Entries tab lists.'),
+        field('Entries tab shows', showSel),
+      ));
+    }
+    if (recs.length) {
+      const selfOwners = owners.filter((o) => o.self);
+      const ownerSel = select(selfOwners.map((o) => [String(o.id), o.name || String(o.id)]), null);
+      container.appendChild(section('Move to another account',
+        hint('Moves every custom entry and its activities to the selected account (only accounts you\'ve been logged into are listed).'),
+        ...(selfOwners.length ? [
+          field('Account', ownerSel),
+          btnRow(el('button', {
+            class: 'blue',
+            onclick: () => {
+              const targetId = parseInt(ownerSel.value, 10);
+              const target = db.owners[targetId];
+              if (!target) return;
+              const moved = migrateAllTo(targetId);
+              rerender();
+              if (moved) toast(`Moved ${moved} entr${moved === 1 ? 'y' : 'ies'} to ${target.name}. Reload to see them there.`);
+              else toast(`Everything already belongs to ${target.name}`, true);
+            },
+          }, 'Move All')),
+        ] : [hint('No other account known yet.')]),
+      ));
+    }
+
+    // Export copies JSON to the clipboard; import pastes it here and merges
+    // (newest edit per record wins, tombstones respected) or, after typing
+    // "confirm", replaces the whole database.
+    const ta = el('textarea', { spellcheck: 'false', placeholder: 'Paste export JSON here' });
+    ta.style.display = 'block';
+    const parseTa = () => {
+      if (!ta.value.trim()) { toast('Paste export JSON first', true); ta.focus(); return null; }
+      let parsed;
+      try { parsed = migrateDB(unpackDB(JSON.parse(ta.value))); } catch (e) { toast('Invalid JSON', true); return null; }
+      if (!parsed || !parsed.entries) { toast('Not a custom-entries export', true); return null; }
+      return parsed;
+    };
+    const ownerNow = currentOwner();
+    container.appendChild(section('Export / Import',
+      hint('Merge Import combines a pasted export with this database (newest edit of each entry wins); Replace swaps everything.'),
+      btnRow(
+        el('button', { onclick: () => copyText(JSON.stringify(packDB(db)), 'Copied the whole database as JSON') }, 'Copy all as JSON'),
+        ...(ownerNow ? [el('button', { onclick: () => copyText(exportSlice(allRecs().filter((r) => r.ownerId === ownerNow.id)), `Copied ${ownerNow.name}'s entries as JSON`) }, `Copy ${ownerNow.name}'s as JSON`)] : []),
+      ),
+      ta,
+      btnRow(
+        el('button', {
+          class: 'blue',
+          onclick: () => {
+            const parsed = parseTa();
+            if (!parsed) return;
+            const before = db;
+            db = mergeDBs(db, parsed);
+            const rep = mergeReport(before, db);
+            saveDB();
+            rerender();
+            const n = rep.items.length + rep.more;
+            toast(`Merged: ${n} entr${n === 1 ? 'y' : 'ies'} added or updated. Reload the page.`);
+          },
+        }, 'Merge Import'),
+        el('button', {
+          onclick: async () => {
+            const parsed = parseTa();
+            if (!parsed) return;
+            const n = Object.keys(parsed.entries).length;
+            const ok = await confirmModal({ title: 'Replace database', message: `This discards the current ${allRecs().length} entr${allRecs().length === 1 ? 'y' : 'ies'} and everything attached to them, and loads the ${n} from the pasted export instead. Synced devices will follow.`, actionLabel: 'Replace database' });
+            if (!ok) return;
+            db = parsed;
+            saveDB();
+            rerender();
+            toast('Database replaced. Reload the page.');
+          },
+        }, 'Replace database'),
+      ),
+    ));
+
     const delAllBtn = el('button', { class: 'alce-danger' }, 'Delete All Custom Entries');
-    let armTimer = null;
-    delAllBtn.addEventListener('click', () => {
+    delAllBtn.addEventListener('click', async () => {
       const n = allRecs().length;
       if (!n) { toast('Nothing to delete', true); return; }
-      if (!delAllBtn.dataset.armed) {
-        // Two-step confirm: arm for 5 seconds instead of a blocking dialog.
-        delAllBtn.dataset.armed = '1';
-        delAllBtn.textContent = `Really delete ${n} entr${n === 1 ? 'y' : 'ies'}? Click again`;
-        armTimer = setTimeout(() => {
-          delete delAllBtn.dataset.armed;
-          delAllBtn.textContent = 'Delete All Custom Entries';
-        }, 5000);
-        return;
-      }
-      clearTimeout(armTimer);
+      const ok = await confirmModal({ title: 'Delete all custom entries', message: `This deletes all ${n} custom entr${n === 1 ? 'y' : 'ies'} and their activities from this database. Deletions replicate to synced devices as tombstones. This cannot be undone.`, actionLabel: `Delete ${n} entr${n === 1 ? 'y' : 'ies'}` });
+      if (!ok) return;
       for (const rec of allRecs()) {
         markDeleted(rec.id);
         delete db.entries[rec.id];
@@ -6429,48 +6806,94 @@
         delete db.activities[id];
       }
       saveDB();
-      renderManage(container, overlay);
+      rerender();
       toast(`Deleted ${n} entr${n === 1 ? 'y' : 'ies'}. Reload the page.`);
     });
-    // --- profile statistics toggle ---
-    const statsChk = el('input', { type: 'checkbox' });
-    statsChk.checked = statsBumpEnabled();
-    statsChk.onchange = () => {
-      syncCfg.statsBump = statsChk.checked;
-      saveSyncCfg();
-      toast(statsChk.checked
-        ? 'Custom entries now count in your profile statistics (reload the profile to see it)'
-        : 'Custom entries no longer count in your profile statistics (reload the profile to see it)');
-    };
-    container.appendChild(el('div', { class: 'alce-sync' },
-      el('div', { class: 'alce-manage-title' }, 'Profile statistics'),
-      el('label', { class: 'alce-check' }, statsChk,
-        el('span', {}, 'Count custom entries in profile statistics: total anime/manga, episodes and days watched, chapters and volumes read, the status / format / genre / year / country breakdowns on the Stats pages, and the Activity History heatmap (all local activities, past ones included). Client-side only (a 100-chapter entry read to the end adds 100 to Chapters Read); mean score stays as the server reports it.')),
-    ));
+    container.appendChild(section('Danger zone', btnRow(delAllBtn)));
+  }
 
-    // --- search placement toggle ---
-    const searchChk = el('input', { type: 'checkbox' });
-    searchChk.checked = searchBumpEnabled();
-    searchChk.onchange = () => {
-      syncCfg.searchBump = searchChk.checked;
-      saveSyncCfg();
-      toast(searchChk.checked
-        ? 'Custom entries now sit on top of search results'
-        : 'Custom entries now follow the search sort (popularity and friends put them last)');
+  /* --- Debug tab: diagnostics + RPC logging. --- */
+  async function runDiagnostics(report) {
+    const rows = [];
+    const add = (name, ok, detail) => rows.push({ name, ok, detail: String(detail || '') });
+    const t0 = window.__ALCE_T0;
+    add('Script', true, `v${window.__ALCE_VERSION || '?'} · db v${db.version || '?'}`);
+    add('Injection', t0 !== undefined && t0 < 100, t0 === undefined ? 'unknown' : `${Math.round(t0)} ms after navigation start${t0 >= 100 ? ' (late: the first page queries may have run before the hooks; heal passes cover known pages)' : ''}`);
+    add('Worker hook', window.Worker === PatchedWorker, window.Worker === PatchedWorker ? 'installed' : 'MISSING (window.Worker replaced by something else)');
+    add('fetch hook', window.fetch !== nativeFetch, window.fetch !== nativeFetch ? 'installed' : 'MISSING (window.fetch was replaced after the script ran)');
+    add('RPC traffic', audit.leaked === 0, `${audit.handledLocal} handled locally · ${audit.passedThrough} forwarded · ${audit.leaked} leaked${audit.leaked ? ' ⚠' : ''}`);
+    const store = vueStore();
+    add('Vue store', !!store, store ? 'reachable' : 'not found (page not mounted yet?)');
+    const uid = authUserId();
+    const owners = Object.values(db.owners);
+    add('Account', !!uid, uid ? `viewer ${uid} · owners known: ${owners.map((o) => (o.name || o.id) + (o.self ? '' : ' (browsed)')).join(', ') || 'none'}` : 'not logged in / auth blob missing');
+    const recs = allRecs();
+    let embedded = 0;
+    for (const rec of recs) for (const u of [rec.media.coverImage && rec.media.coverImage.large, rec.media.bannerImage]) if (isDataUrl(u)) embedded++;
+    let bytes = 0;
+    try { bytes = (localStorage.getItem(LS_KEY) || '').length; } catch (e) { /* ignore */ }
+    let quota = '';
+    try { if (navigator.storage && navigator.storage.estimate) { const est = await navigator.storage.estimate(); quota = ` · origin storage ${Math.round((est.usage || 0) / 1024)} KB used`; } } catch (e) { /* ignore */ }
+    add('Database', bytes < 4 * 1024 * 1024, `${recs.length} entries · ${Object.keys(db.activities).length} activities · ${embedded} embedded image${embedded === 1 ? '' : 's'} · ${Math.round(bytes / 1024)} KB in localStorage${bytes >= 4 * 1024 * 1024 ? ' (near the ~5 MB quota)' : ''}${quota}`);
+    if (syncConfigured()) {
+      try {
+        const r = await ghPull();
+        let enc = false;
+        try { enc = isEnvelope(r.json); } catch (e) { /* ignore */ }
+        add('GitHub sync', true, `${syncCfg.repo} reachable · ${r.sha ? 'file present' : 'no file yet'}${enc ? ' · encrypted' : ''} · ${syncCfg.lastStatus || ''}`);
+      } catch (e) { add('GitHub sync', false, `${syncCfg.repo}: ${e.message}`); }
+    } else add('GitHub sync', true, 'not configured');
+    if (imgHostConfigured()) {
+      try {
+        const r = await gmRequest(imgHostBase() + '/covers', { headers: { Authorization: 'Bearer ' + syncCfg.imgToken }, accept: 'application/json' });
+        const j = JSON.parse(r.responseText);
+        add('Image host', true, `${imgHostBase()} reachable · ${j.count} images`);
+      } catch (e) { add('Image host', false, `${imgHostBase()}: ${e.message}`); }
+    } else add('Image host', true, 'not configured');
+    add('GM_xmlhttpRequest', !!gmXHR, gmXHR ? 'available (MangaDex / Dynasty / RanobeDB imports and image embedding)' : 'missing: those import sources are unavailable and embedding falls back to plain fetch');
+    add('Toggles', true, `stats ${statsBumpEnabled() ? 'on' : 'off'} · search-on-top ${searchBumpEnabled() ? 'on' : 'off'} · RPC log ${DEBUG_RPC() ? 'on' : 'off'}`);
+    report(rows);
+    return rows;
+  }
+  function renderDebugTab(container, section, hint, btnRow) {
+    const out = el('div', { class: 'alce-report' });
+    let last = null;
+    const draw = (rows) => {
+      last = rows;
+      out.textContent = '';
+      for (const r of rows) {
+        out.appendChild(el('div', { class: 'alce-report-row ' + (r.ok ? 'ok' : 'bad') },
+          el('span', { class: 'alce-report-kind' }, (r.ok ? '✓ ' : '✕ ') + r.name),
+          el('span', { class: 'alce-report-title' }, r.detail)));
+      }
     };
-    container.appendChild(el('div', { class: 'alce-sync' },
-      el('div', { class: 'alce-manage-title' }, 'Search'),
-      el('label', { class: 'alce-check' }, searchChk,
-        el('span', {}, 'Bump custom entries to the top of search results, whatever the sort. Off: they take their proper place, interleaved by title / date / length sorts and at the very end for popularity, trending, score and favourites, which they have no value for.')),
+    const runBtn = el('button', { class: 'blue' }, 'Run diagnostics');
+    runBtn.addEventListener('click', async () => {
+      runBtn.disabled = true; runBtn.textContent = 'Running…';
+      out.textContent = ''; out.appendChild(hint('Checking…'));
+      try { await runDiagnostics(draw); } catch (e) { draw([{ name: 'Diagnostics', ok: false, detail: String(e) }]); }
+      runBtn.disabled = false; runBtn.textContent = 'Run again';
+    });
+    const copyBtn = el('button', {
+      onclick: async () => {
+        if (!last) { toast('Run the diagnostics first', true); return; }
+        const text = last.map((r) => `${r.ok ? 'OK ' : 'BAD'} ${r.name}: ${r.detail}`).join('\n');
+        try { await navigator.clipboard.writeText(text); toast('Report copied'); } catch (e) { toast('Copy failed (clipboard blocked)', true); }
+      },
+    }, 'Copy report');
+    const rpcChk = el('input', { type: 'checkbox' });
+    rpcChk.checked = DEBUG_RPC();
+    rpcChk.onchange = () => { try { if (rpcChk.checked) localStorage.setItem('alce-debug', '1'); else localStorage.removeItem('alce-debug'); } catch (e) { /* ignore */ } toast(rpcChk.checked ? 'RPC logging on (see the console)' : 'RPC logging off'); };
+    container.appendChild(section('Diagnostics',
+      hint('Checks hooks, injection timing, the leak tripwire, storage, sync and image host. Nothing is sent anywhere.'),
+      btnRow(runBtn, copyBtn),
+      out,
     ));
-
-    container.appendChild(el('div', { class: 'alce-move' },
-      el('div', {
-        class: 'alce-manage-title alce-hinted',
-        title: 'Removes every custom entry and all their activities from this database. Deletions replicate to synced devices as tombstones.',
-      }, 'Danger Zone'),
-      el('div', { class: 'alce-io-btns' }, delAllBtn),
+    container.appendChild(section('Logging',
+      el('label', { class: 'alce-check' }, rpcChk, el('span', {}, el('b', {}, 'Log every worker RPC'), el('div', { class: 'alce-check-desc' }, 'Query, variables, page options and response entity types, in the console.'))),
+      btnRow(el('button', { onclick: () => { auditReport(); toast('Leak audit printed to the console'); } }, 'Print leak audit')),
     ));
+    runBtn.click();
   }
 
   function intOrNull(v) {
@@ -6479,13 +6902,14 @@
   }
 
   function alertBox(msg) {
-    const overlay = el('div', { class: 'alce-overlay', onclick: (e) => { if (e.target === overlay) overlay.remove(); } },
-      el('div', { class: 'alce-modal' },
-        el('h2', {}, 'Custom Entries'),
+    const overlay = el('div', { class: 'alce-overlay', onclick: (e) => { if (e.target === overlay) overlay.remove(); } });
+    overlay.appendChild(el('div', { class: 'alce-modal' },
+      el('div', { class: 'alce-modal-top' }, modalHead('Custom Entries', overlay)),
+      el('div', { class: 'alce-modal-body' },
         el('div', {}, msg),
         el('div', { class: 'alce-btns' },
-          el('button', { class: 'alce-btn primary', onclick: () => overlay.remove() }, 'OK')),
-      ));
+          el('button', { class: 'alce-btn primary', onclick: () => overlay.remove() }, 'OK'))),
+    ));
     document.body.appendChild(overlay);
   }
 
