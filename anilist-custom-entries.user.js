@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AniList Custom Entries
 // @namespace    al-custom-entries
-// @version      1.40.2
+// @version      1.41.3
 // @description  Create fully client-side custom anime/manga entries on AniList that behave like normal list entries (rate, note, custom lists, progress, favourite, delete) via the native UI, including local activity feed entries and the home page's in-progress lists. Optionally syncs the database to a private GitHub repo for cross-device use.
 // @author       john
 // @homepageURL  https://github.com/johnthreekay/anilist-custom-entries
@@ -36,7 +36,7 @@
   const window = (typeof unsafeWindow === 'object' && unsafeWindow) ? unsafeWindow : globalThis;
 
   const TAG = '[AL-Custom]';
-  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.40.2'; } catch (e) { /* diagnostics only */ }
+  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.41.3'; } catch (e) { /* diagnostics only */ }
   const ID_BASE = 2000000000; // far above any real AniList media/entry id, still within GraphQL Int32
   const LS_KEY = 'al-custom-entries-v1';
 
@@ -735,7 +735,52 @@
     try { enrichRecTags(rec); } catch (e) { /* catalog not loaded yet */ }
     const m = Object.assign({}, rec.media, { mediaListEntry: recIsListed(rec) ? rec.id : null });
     if (m.description) m.description = sanitizeHtml(m.description);
+    m.nextAiringEpisode = nextAiringOf(rec);
     return m;
+  }
+
+  /* --- airing schedule (custom anime): rec.media.airingSchedule =
+   * [{airingAt, episode}], edited through the edit page's native Airing
+   * Schedule section (its generator query has no custom id and is
+   * forwarded; load and save are answered locally). The next unaired item
+   * becomes media.nextAiringEpisode: countdown on the media page and the
+   * home cards, "behind" counts on the list, and local airing
+   * notifications (see tickNotifications). --- */
+  function airingScheduleOf(rec) {
+    const a = rec && rec.media && rec.media.airingSchedule;
+    return Array.isArray(a) ? a.filter((x) => x && Number.isFinite(x.airingAt) && Number.isFinite(x.episode)).slice().sort((x, y) => x.airingAt - y.airingAt || x.episode - y.episode) : [];
+  }
+  function nextAiringOf(rec) {
+    if (!rec || rec.type !== 'ANIME') return null;
+    const now = nowSec();
+    const next = airingScheduleOf(rec).find((a) => a.airingAt > now);
+    return next ? { airingAt: next.airingAt, timeUntilAiring: next.airingAt - now, episode: next.episode } : null;
+  }
+  function airingSchedulesResult(rec) {
+    return { Page: { pageInfo: { hasNextPage: false }, airingSchedules: airingScheduleOf(rec).map((a) => ({ airingAt: a.airingAt, timeUntilAiring: a.airingAt - nowSec(), episode: a.episode })) } };
+  }
+  function handleSaveAiringSchedule(rec, vars) {
+    if (!rec) return { SaveAiringSchedule: false };
+    const items = (Array.isArray(vars.airingSchedule) ? vars.airingSchedule : [])
+      .map((a) => ({ airingAt: parseInt(a && a.airingAt, 10), episode: parseInt(a && a.episode, 10) }))
+      .filter((a) => Number.isFinite(a.airingAt) && Number.isFinite(a.episode) && a.episode > 0);
+    const seen = new Set();
+    rec.media.airingSchedule = items.filter((a) => (seen.has(a.episode) ? false : seen.add(a.episode)))
+      .sort((x, y) => x.airingAt - y.airingAt || x.episode - y.episode);
+    // Episodes that already aired when the schedule was set don't notify.
+    const now = nowSec();
+    const aired = rec.media.airingSchedule.filter((a) => a.airingAt <= now);
+    notifs.airedUntil[rec.id] = aired.length ? aired[aired.length - 1].airingAt : now;
+    // Reminders for airings the new schedule no longer has were wrong: drop them.
+    notifs.items = notifs.items.filter((n) => !(n.type === 'AIRING' && n.mediaId === rec.id
+      && !rec.media.airingSchedule.some((a) => a.episode === n.episode && a.airingAt === n.createdAt)));
+    saveNotifs();
+    logRevision(rec, 'EDIT', { 'airing schedule': 'Modified' });
+    touchRec(rec);
+    saveDB();
+    pushRecEntities(rec);
+    console.log(TAG, 'saved airing schedule for custom entry', rec.id, rec.media.airingSchedule.length, 'episode(s)');
+    return { SaveAiringSchedule: true };
   }
 
   function userEntity(ownerId) {
@@ -747,12 +792,190 @@
    * media}]): target is a real AniList id (media stub captured at save
    * time so cards render offline) or another custom entry's id. --- */
 
+  /* --- local notifications: airing reminders for custom anime with a
+   * schedule ("Episode N of X aired.") and release-day reminders for
+   * entries with a full start date ("X starts releasing today."), shown in
+   * the native notifications page and counted in the nav badge. Also flips
+   * NOT_YET_RELEASED → RELEASING / RELEASING → FINISHED when a full start /
+   * end date is reached, as the site does for real entries. Device-local
+   * (reminders are not synced); generated lazily on the UI tick. --- */
+  const NOTIF_KEY = 'al-custom-entries-notifs-v1';
+  const NOTIF_BASE = ID_BASE + 900000000;
+  const NOTIF_CAP = 200;
+  function loadNotifs() {
+    try {
+      const v = JSON.parse(localStorage.getItem(NOTIF_KEY) || 'null');
+      if (v && typeof v === 'object') return { seq: v.seq || 0, items: Array.isArray(v.items) ? v.items : [], airedUntil: v.airedUntil || {}, released: v.released || {}, lastTick: v.lastTick || 0 };
+    } catch (e) { /* fresh */ }
+    return { seq: 0, items: [], airedUntil: {}, released: {}, lastTick: 0 };
+  }
+  let notifs = loadNotifs();
+  function saveNotifs() {
+    try { localStorage.setItem(NOTIF_KEY, JSON.stringify(notifs)); } catch (e) { /* quota */ }
+  }
+  function addNotif(n) {
+    notifs.seq += 1;
+    const item = Object.assign({ id: NOTIF_BASE + notifs.seq, read: false }, n);
+    notifs.items.push(item);
+    if (notifs.items.length > NOTIF_CAP) notifs.items.splice(0, notifs.items.length - NOTIF_CAP);
+    return item;
+  }
+  const localNotifsFor = (uid) => notifs.items.filter((n) => n.ownerId === uid && recById(n.mediaId)).sort((a, b) => b.createdAt - a.createdAt || b.id - a.id);
+  const unreadLocalNotifs = (uid) => localNotifsFor(uid).filter((n) => !n.read);
+  function notifEntity(n) {
+    if (n.type === 'AIRING') return { id: n.id, type: 'AIRING', episode: n.episode, contexts: ['Episode ', ' of ', ' aired.'], media: n.mediaId, createdAt: n.createdAt };
+    return { id: n.id, type: 'RELATED_MEDIA_ADDITION', context: n.context || ' started releasing.', media: n.mediaId, createdAt: n.createdAt };
+  }
+  const fuzzySec = (d) => (d && d.year && d.month && d.day ? Math.floor(new Date(d.year, d.month - 1, d.day).getTime() / 1000) : null);
+  // Generate due notifications and apply date-driven status flips.
+  // Idempotent; cheap enough to run on the UI tick (throttled to a minute).
+  function tickNotifications(force) {
+    const now = nowSec();
+    if (!force && now - (notifs.lastTick || 0) < 60) return;
+    notifs.lastTick = now;
+    const uid = authUserId();
+    let changedDb = false;
+    let added = 0;
+    for (const rec of allRecs()) {
+      const md = rec.media || {};
+      // Status flips from dates (any owner: it's data, not a reminder).
+      const start = fuzzySec(md.startDate);
+      const end = fuzzySec(md.endDate);
+      if (start !== null && start <= now && md.status === 'NOT_YET_RELEASED') {
+        md.status = 'RELEASING'; logRevision(rec, 'EDIT', { status: 'Modified' }); touchRec(rec); changedDb = true;
+        console.log(TAG, 'custom entry reached its start date: now releasing', rec.id);
+      }
+      if (end !== null && end + 86400 <= now && md.status === 'RELEASING') {
+        md.status = 'FINISHED'; logRevision(rec, 'EDIT', { status: 'Modified' }); touchRec(rec); changedDb = true;
+        console.log(TAG, 'custom entry reached its end date: now finished', rec.id);
+      }
+      if (!uid || rec.ownerId !== uid) continue;
+      // Airing reminders (anime with a schedule).
+      const sched = airingScheduleOf(rec);
+      if (sched.length) {
+        let until = notifs.airedUntil[rec.id];
+        if (until === undefined) { until = now; notifs.airedUntil[rec.id] = now; } // first sight: no backfill
+        for (const a of sched) {
+          if (a.airingAt <= until || a.airingAt > now) continue;
+          addNotif({ type: 'AIRING', ownerId: uid, mediaId: rec.id, episode: a.episode, createdAt: a.airingAt });
+          notifs.airedUntil[rec.id] = a.airingAt;
+          added++;
+        }
+      }
+      // Release-day reminder: once, for entries added before their start
+      // date (catalogued-after-the-fact entries never notify), within 30 days.
+      if (start !== null && !notifs.released[rec.id]) {
+        const createdAt = (rec.entry && rec.entry.createdAt) || 0;
+        if (start <= now && createdAt && createdAt < start && now - start < 30 * 86400) {
+          addNotif({ type: 'RELATED_MEDIA_ADDITION', ownerId: uid, mediaId: rec.id, context: rec.type === 'ANIME' && !sched.length ? ' started airing today.' : ' started releasing today.', createdAt: start });
+          added++;
+        }
+        if (start <= now) notifs.released[rec.id] = true;
+      }
+    }
+    for (const id of Object.keys(notifs.airedUntil)) if (!recById(parseInt(id, 10))) delete notifs.airedUntil[id];
+    for (const id of Object.keys(notifs.released)) if (!recById(parseInt(id, 10))) delete notifs.released[id];
+    saveNotifs();
+    if (changedDb) saveDB();
+    if (added) console.log(TAG, `${added} local notification${added === 1 ? '' : 's'} added`);
+    return added;
+  }
+  // Viewer entity: the nav badge counts local unread reminders too. The
+  // marker records what was added so re-runs (and the store heal) adjust
+  // by the difference only.
+  function bumpUnreadCount(u) {
+    if (!u || typeof u !== 'object') return false;
+    const n = unreadLocalNotifs(u.id).length;
+    const prev = u.__alceUnread || 0;
+    if (n === prev) return false;
+    u.unreadNotificationCount = Math.max(0, (u.unreadNotificationCount || 0) - prev + n);
+    u.__alceUnread = n;
+    return true;
+  }
+  function patchViewer(result) {
+    const ents = result && result.entities;
+    const u = ents && ents.user && typeof result.result === 'number' ? ents.user[result.result] : null;
+    if (bumpUnreadCount(u)) console.log(TAG, 'nav badge includes', u.__alceUnread, 'local notification(s)');
+  }
+  // Notifications page (feed 'all' | 'airing' | 'media' ...): page 1 gets
+  // the local reminders, unread ones first (the page marks the first
+  // unreadNotificationCount rows as unread), read ones merged by time.
+  const NOTIF_FEEDS = { all: null, airing: ['AIRING'], media: ['RELATED_MEDIA_ADDITION'] };
+  function patchNotifications(result, meta) {
+    const ents = result && result.entities;
+    const pg = ents && ents.page && ents.page[meta.pageId];
+    if (!pg || !Array.isArray(pg.pageData) || (meta.page || 1) !== 1) return;
+    const uid = authUserId();
+    if (!uid || !(meta.feed in NOTIF_FEEDS)) return;
+    const types = NOTIF_FEEDS[meta.feed];
+    const mine = localNotifsFor(uid).filter((n) => !types || types.includes(n.type)).filter((n) => !pg.pageData.includes(n.id));
+    if (!mine.length) return;
+    ents.notification = ents.notification || {};
+    ents.media = ents.media || {};
+    const timeOf = (id) => { const e = ents.notification[id]; return e ? e.createdAt || 0 : 0; };
+    const unread = mine.filter((n) => !n.read);
+    const read = mine.filter((n) => n.read);
+    for (const n of mine) { ents.notification[n.id] = notifEntity(n); ents.media[n.mediaId] = mediaEntity(recById(n.mediaId)); }
+    const merged = pg.pageData.slice();
+    for (const n of read) {
+      let i = merged.findIndex((id) => !isCustomId(id) && timeOf(id) < n.createdAt);
+      if (i === -1) i = merged.length;
+      merged.splice(i, 0, n.id);
+    }
+    pg.pageData = unread.map((n) => n.id).concat(merged);
+    if (pg.pageInfo && typeof pg.pageInfo.total === 'number') pg.pageInfo.total += mine.length;
+    console.log(TAG, `added ${mine.length} local notification${mine.length === 1 ? '' : 's'} to the ${meta.feed} feed`);
+    // Opening the feed marks them read (the site resets its own count the
+    // same way); the page keeps its highlight until the count is reset.
+    if (meta.feed === 'all' && unread.length) {
+      setTimeout(() => { for (const n of unread) n.read = true; saveNotifs(); }, 1500);
+    }
+  }
+  // Late injection: repair the store's viewer count / notifications page.
+  function healNotifications() {
+    const store = vueStore();
+    const ents = store && entitiesState(store);
+    if (!ents) return;
+    const uid = authUserId();
+    const u = uid && ents.user && ents.user[uid];
+    // Not while the notifications page is open: it keeps its highlight until
+    // the site resets the count on leaving.
+    if (u && !/^\/notifications/.test(location.pathname) && bumpUnreadCount(u)) { try { store.commit('setEntities', { user: { [uid]: { unreadNotificationCount: u.unreadNotificationCount, __alceUnread: u.__alceUnread } } }); } catch (e) { /* ignore */ } }
+    for (const feed of Object.keys(NOTIF_FEEDS)) {
+      const key = 'notifications-' + feed;
+      const pg = ents.page && ents.page[key];
+      const arr = pg && pg.pageData && pg.pageData[1];
+      if (!Array.isArray(arr)) continue;
+      const fake = { entities: { page: { [key]: { pageInfo: {}, pageData: arr.slice() } }, notification: ents.notification || {} } };
+      patchNotifications(fake, { pageId: key, feed, page: 1 });
+      const out = fake.entities.page[key].pageData;
+      if (out.length === arr.length) continue;
+      const patch = { notification: {}, media: {} };
+      for (const id of out) if (!arr.includes(id)) { patch.notification[id] = fake.entities.notification[id]; }
+      for (const id of Object.keys(patch.notification)) { const n = notifs.items.find((x) => x.id === parseInt(id, 10)); if (n && recById(n.mediaId)) patch.media[n.mediaId] = mediaEntity(recById(n.mediaId)); }
+      try { store.commit('setEntities', patch); } catch (e) { /* ignore */ }
+      arr.splice(0, arr.length, ...out);
+    }
+  }
+
   function recRecEntity(rr) {
     return {
       id: rr.id,
       rating: rr.rating || 0,
       userRating: rr.userRating || 'RATE_UP',
       mediaRecommendation: rr.target,
+      user: authUserId() || 0,
+    };
+  }
+
+  // The same recommendation seen from the other side (on the target's page
+  // the card points back at the custom entry it was made from).
+  function recBacklinkEntity(rec, rr) {
+    return {
+      id: rr.id,
+      rating: rr.rating || 0,
+      userRating: rr.userRating || 'RATE_UP',
+      mediaRecommendation: rec.id,
       user: authUserId() || 0,
     };
   }
@@ -910,13 +1133,24 @@
       }
     }
 
-    if (rec.recs && rec.recs.length) {
-      page['mediaRecommendations-' + id] = recPageEntity(rec);
-      for (const rr of rec.recs) {
+    // Own recommendations, then the inverse of recommendations other custom
+    // entries made towards this one (a pair is stored once, on the entry it
+    // was made from, and shown on both pages like on AniList).
+    const inverseRecs = customRecsTo(id).filter(({ rec: a }) => a.id !== id && !(rec.recs || []).some((x) => x.target === a.id));
+    if ((rec.recs && rec.recs.length) || inverseRecs.length) {
+      const pg = recPageEntity(rec);
+      page['mediaRecommendations-' + id] = pg;
+      for (const rr of rec.recs || []) {
         recommendationEntities[rr.id] = recRecEntity(rr);
         const tm = recTargetMediaEntity(rr);
         if (tm && !mediaEntities[tm.id]) mediaEntities[tm.id] = tm;
       }
+      for (const { rec: a, rr } of inverseRecs) {
+        pg.pageData.push(rr.id);
+        recommendationEntities[rr.id] = recBacklinkEntity(a, rr);
+        if (!mediaEntities[a.id]) mediaEntities[a.id] = mediaEntity(a);
+      }
+      pg.pageInfo.total = pg.pageData.length;
     }
 
     return {
@@ -1494,10 +1728,22 @@
   // SaveRecommendation on a custom entry: upsert into rec.recs (repeated
   // ratings on the same pair update it) and answer with the shapes the
   // recommendation card expects, so no "Internal Server Error" toast.
+  // Rated from the other side (a real page's backlink card, or the inverse
+  // card on another custom entry's page), the pair is still stored once: on
+  // the custom entry it was made from, or on the custom entry being rated
+  // when the page's media is real.
   function handleSaveRecommendation(vars) {
-    const rec = recById(parseInt(vars.mediaId, 10));
+    const mid = parseInt(vars.mediaId, 10);
+    const tid = parseInt(vars.mediaRecommendationId, 10);
+    const a = recById(mid);
+    const b = isCustomId(tid) ? recById(tid) : null;
+    let rec = a;
+    let target = tid;
+    let flipped = false;
+    if (b && (!a || (!(a.recs || []).some((x) => x.target === tid) && (b.recs || []).some((x) => x.target === mid)))) {
+      rec = b; target = mid; flipped = true;
+    }
     if (!rec) return { result: null, entities: {} };
-    const target = parseInt(vars.mediaRecommendationId, 10);
     if (!Number.isFinite(target) || target === rec.id) return { result: null, entities: {} };
     rec.recs = rec.recs || [];
     let rr = rec.recs.find((x) => x.target === target);
@@ -1511,16 +1757,40 @@
     if (!isCustomId(target)) rr.media = mediaStubFromStore(target) || rr.media;
     touchRec(rec);
     saveDB();
-    console.log(TAG, 'saved local recommendation', rec.id, '->', target, rr.userRating);
-    const entities = {
-      recommendation: { [rr.id]: recRecEntity(rr) },
-      page: { ['mediaRecommendations-' + rec.id]: recPageEntity(rec) },
-    };
+    console.log(TAG, 'saved local recommendation', rec.id, '->', target, rr.userRating, flipped ? '(from the target page)' : '');
+    const uid = authUserId();
+    if (flipped) {
+      // The page being viewed is the target: the card points back at `rec`.
+      // No page entity: the app prepends a new card into the current page
+      // itself (from the response's recommendation key).
+      const entities = { recommendation: { [rr.id]: recBacklinkEntity(rec, rr) }, media: { [rec.id]: mediaEntity(rec) } };
+      if (uid) entities.user = { [uid]: userEntity(uid) };
+      return { result: rr.id, entities };
+    }
+    // A new pair is prepended into the page by the app itself (vars.new), so
+    // the page entity is only returned for rating updates.
+    const entities = { recommendation: { [rr.id]: recRecEntity(rr) } };
+    if (!vars.new) entities.page = { ['mediaRecommendations-' + rec.id]: recPageEntity(rec) };
     const tm = recTargetMediaEntity(rr);
     if (tm) entities.media = { [tm.id]: tm };
-    const uid = authUserId();
     if (uid) entities.user = { [uid]: userEntity(uid) };
     return { result: rr.id, entities };
+  }
+
+  // DeleteRecommendation on a local recommendation id (the card's delete
+  // control, from either side): drop it from whichever custom entry holds it.
+  function handleDeleteRecommendation(vars) {
+    const rid = parseInt(vars.id, 10);
+    for (const rec of allRecs()) {
+      const i = (rec.recs || []).findIndex((x) => x.id === rid);
+      if (i === -1) continue;
+      rec.recs.splice(i, 1);
+      touchRec(rec);
+      saveDB();
+      console.log(TAG, 'deleted local recommendation', rid, 'from', rec.id);
+      break;
+    }
+    return { DeleteRecommendation: { deleted: true } };
   }
 
   // Normalized result for the character page (/character/<id>) of a custom
@@ -2295,6 +2565,10 @@
         if (rec) return revisionHistoryResult(rec, vars);
         return { Page: { pageInfo: { total: 0, perPage: 50, currentPage: 1, lastPage: 1, hasNextPage: false }, revisionHistory: [] } };
       }
+      if (isCustomId(vars.id) && query.includes('airingSchedules(')) {
+        const rec = recById(parseInt(vars.id, 10));
+        return rec ? airingSchedulesResult(rec) : { Page: { pageInfo: { hasNextPage: false }, airingSchedules: [] } };
+      }
       if (isCustomId(vars.id) && query.includes('MediaCharacters(')) {
         const rec = recById(parseInt(vars.id, 10));
         return { MediaCharacters: rec ? mediaCharactersShape(rec) : [] };
@@ -2371,6 +2645,9 @@
     if (query.includes('SaveMedia(') && (isCustomId(vars.id) || (ctxRec && vars.id === undefined))) {
       const rec = isCustomId(vars.id) ? recById(parseInt(vars.id, 10)) : ctxRec;
       if (rec) return { SaveMedia: applyMediaEdit(rec, vars) };
+    }
+    if (query.includes('SaveAiringSchedule(') && (isCustomId(vars.mediaId) || ctxRec)) {
+      return handleSaveAiringSchedule(isCustomId(vars.mediaId) ? recById(parseInt(vars.mediaId, 10)) : ctxRec, vars);
     }
     if (query.includes('SaveMediaCharacter(')) return handleSaveMediaCharacter(vars, ctxRec);
     if (query.includes('SaveCharacter(') && (ctxRec || isCustomId(vars.id))) {
@@ -3186,6 +3463,12 @@
     }
     return out;
   };
+  // Custom entries that recommend `mediaId` (real or custom).
+  const customRecsTo = (mediaId) => {
+    const out = [];
+    for (const rec of viewerRecs()) for (const rr of rec.recs || []) if (rr.target === mediaId) out.push({ rec, rr });
+    return out;
+  };
   const passesOnList = (rec, onList) => (onList === true ? recIsListed(rec) : (onList === false ? !recIsListed(rec) : true));
 
   // Real media entity: add inverse relation edges to the custom entries.
@@ -3201,10 +3484,35 @@
     }
     return n;
   }
+  // Real media page's recommendation strip / tab: prepend cards for the
+  // custom entries that recommend it ("users also like" → your entry).
+  // `recEnts` is the recommendation entity table the list renders from, for
+  // skipping pairs already present.
+  function addRecBacklinks(arr, ents, pageInfo, hits, recEnts) {
+    if (!Array.isArray(arr)) return 0;
+    let n = 0;
+    for (const { rec, rr } of hits) {
+      if (arr.includes(rr.id)) continue;
+      if (arr.some((rid) => { const e = recEnts && recEnts[rid]; return e && e.mediaRecommendation === rec.id; })) continue;
+      arr.unshift(rr.id);
+      ents.recommendation = ents.recommendation || {};
+      ents.recommendation[rr.id] = recBacklinkEntity(rec, rr);
+      ents.media = ents.media || {};
+      ents.media[rec.id] = mediaEntity(rec);
+      n++;
+    }
+    if (n && pageInfo && typeof pageInfo.total === 'number') pageInfo.total += n;
+    return n;
+  }
   function patchMediaBacklinks(result, meta) {
     const ents = result.entities;
     const n = addMediaBacklinks(ents && ents.media && ents.media[meta.id], ents, meta.backs);
     if (n) console.log(TAG, `added ${n} custom relation backlink${n === 1 ? '' : 's'} to media ${meta.id}`);
+    const pg = ents && ents.page && ents.page['mediaRecommendations-' + meta.id];
+    if (pg && (meta.page || 1) === 1 && meta.recBacks && meta.recBacks.length) {
+      const k = addRecBacklinks(pg.pageData, ents, pg.pageInfo, meta.recBacks, ents.recommendation);
+      if (k) console.log(TAG, `added ${k} custom recommendation backlink${k === 1 ? '' : 's'} to media ${meta.id}`);
+    }
   }
   // Real character's roles page: prepend the custom entries it appears in.
   function addCharacterBacklinks(arr, ents, pageInfo, hits) {
@@ -3260,6 +3568,9 @@
       const me = ents.media[parseInt(m[2], 10)];
       const backs = me ? customRelationsTo(me.id) : [];
       if (backs.length) changed += addMediaBacklinks(me, patch, backs);
+      const rpg = ents.page && ents.page['mediaRecommendations-' + m[2]];
+      const rarr = rpg && rpg.pageData && rpg.pageData[1];
+      if (Array.isArray(rarr)) changed += addRecBacklinks(rarr, patch, rpg.pageInfo, customRecsTo(parseInt(m[2], 10)), ents.recommendation);
     }
     for (const key of Object.keys(ents.page || {})) {
       const isChar = key.indexOf('characterMediaRoles-{') === 0;
@@ -3277,7 +3588,12 @@
       else if (isStaff) changed += addStaffBacklinks(arr, patch, pg.pageInfo, customEntriesWithStaff(id, v.type || null).filter((h) => passesOnList(h.rec, v.onList)));
       else changed += addStudioBacklinks(arr, patch, pg.pageInfo, studioHits(id, v.onList));
     }
-    if (changed && patch.media) { try { store.commit('setEntities', { media: patch.media }); } catch (e) { /* ignore */ } }
+    if (changed && (patch.media || patch.recommendation)) {
+      const ent = {};
+      if (patch.media) ent.media = patch.media;
+      if (patch.recommendation) ent.recommendation = patch.recommendation;
+      try { store.commit('setEntities', ent); } catch (e) { /* ignore */ }
+    }
   }
 
   // The Add Recommendation modal's media search pages are keyed
@@ -3288,8 +3604,9 @@
     if (typeof rid !== 'string') return;
     const m = rid.match(/^(ANIME|MANGA)-"rec-(.*)"$/);
     if (!m) return;
-    const self = mediaRouteRec();
-    if (!self) return; // only offer custom entries on custom entries' pages
+    const rm = location.pathname.match(/^\/(anime|manga)\/(\d+)/);
+    const selfId = rm ? parseInt(rm[2], 10) : 0;
+    if (!selfId) return; // only from a media page (custom or real)
     const page = result.entities.page && result.entities.page[rid];
     if (!page || !page.pageData) return;
     let arr = Array.isArray(page.pageData) ? page.pageData : null;
@@ -3301,7 +3618,7 @@
     const q = m[2].toLowerCase();
     result.entities.media = result.entities.media || {};
     for (const rec of allRecs()) {
-      if (rec.type !== m[1] || rec.id === self.id || arr.includes(rec.id)) continue;
+      if (rec.type !== m[1] || rec.id === selfId || arr.includes(rec.id)) continue;
       const hay = (rec.media.title.userPreferred + ' ' + (rec.media.synonyms || []).join(' ')).toLowerCase();
       if (!hay.includes(q)) continue;
       arr.unshift(rec.id);
@@ -3637,6 +3954,10 @@
         w.__alPending.set(msg.id, { kind: 'activityFeed', pageId: pid, vars });
         return false;
       }
+      if (pageOpt.schema === 'notification' && pid.indexOf('notifications-') === 0) {
+        w.__alPending.set(msg.id, { kind: 'notifications', pageId: pid, feed: pid.slice('notifications-'.length), page: vars.page });
+        return false;
+      }
       // Search pages: forward, then prepend matching custom entries.
       if (pageOpt.key === 'media' && searchTypeOf(pid) && pid.indexOf('-{') !== -1) {
         w.__alPending.set(msg.id, { kind: 'search', pageId: pid, vars });
@@ -3668,6 +3989,11 @@
       w.__alPending.set(msg.id, { kind: 'quickSearch', vars });
       return false;
     }
+    // Logged-in viewer: the nav badge counts local unread reminders too.
+    if (opts.schema === 'user' && opts.root === 'Viewer' && typeof query === 'string' && /\bViewer\b/.test(query)) {
+      w.__alPending.set(msg.id, { kind: 'viewer' });
+      return false;
+    }
 
     if (typeof query !== 'string') return false;
 
@@ -3676,7 +4002,8 @@
       const rid = parseInt(vars.id, 10);
       if (rid && opts.schema === 'media' && /\bMedia\(/.test(query)) {
         const backs = customRelationsTo(rid);
-        if (backs.length) w.__alPending.set(msg.id, { kind: 'mediaBacklinks', id: rid, backs });
+        const recBacks = customRecsTo(rid);
+        if (backs.length || recBacks.length) w.__alPending.set(msg.id, { kind: 'mediaBacklinks', id: rid, backs, recBacks, page: vars.page });
       } else if (rid && opts.schema === 'character' && vars.withRoles && pageOpt && pageOpt.id) {
         if (customEntriesWithCharacter(rid).length) w.__alPending.set(msg.id, { kind: 'characterBacklinks', id: rid, pageId: String(pageOpt.id), vars });
       } else if (rid && opts.schema === 'staff' && vars.withStaffRoles && pageOpt && pageOpt.id) {
@@ -3719,7 +4046,11 @@
       respond(w, msg.id, handleFav(vars));
       return true;
     }
-    if (query.includes('SaveRecommendation') && isCustomId(vars.mediaId)) {
+    if (query.includes('DeleteRecommendation') && isCustomId(vars.id)) {
+      respond(w, msg.id, handleDeleteRecommendation(vars));
+      return true;
+    }
+    if (query.includes('SaveRecommendation') && (isCustomId(vars.mediaId) || isCustomId(vars.mediaRecommendationId))) {
       respond(w, msg.id, handleSaveRecommendation(vars));
       return true;
     }
@@ -3879,6 +4210,8 @@
         if (d.result) {
           try {
             if (meta.kind === 'activityFeed') patchActivityFeed(d.result, meta);
+            else if (meta.kind === 'notifications') patchNotifications(d.result, meta);
+            else if (meta.kind === 'viewer') patchViewer(d.result);
             else if (meta.kind === 'listPreview') patchListPreview(d.result, meta);
             else if (meta.kind === 'search') patchSearchResult(d.result, meta);
             else if (meta.kind === 'quickSearch') patchQuickSearch(d.result, meta);
@@ -4674,6 +5007,342 @@
     const j = await metaFetchJson(
       MAL_API + (anime ? 'anime' : 'manga') + '?q=' + encodeURIComponent(q) + '&limit=8');
     return (j.data || []).map((d) => jikanNormalize(d, anime));
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Bulk import (Settings → Bulk import)
+   *
+   * A MAL list export (XML, also .xml.gz), a MangaBaka library (personal
+   * access token) or a CSV become custom entries in one go, reusing the
+   * provider normalizers above for metadata. Rows share one shape:
+   *   { title, type, format, mediaStatus, episodes, chapters, volumes,
+   *     cover, description, genres, tags, synonyms, year, isAdult,
+   *     external: {mal, mangabaka, anilist},
+   *     list: {status, progress, progressVolumes, score100, score, repeat,
+   *            notes, startedAt, completedAt, private} }
+   * Entries that exist on AniList are skipped by default (they belong on
+   * the real list), as are rows already imported (same MAL / MangaBaka id).
+   * ------------------------------------------------------------------ */
+  const MAL_LIST_STATUS = {
+    watching: 'CURRENT', reading: 'CURRENT', completed: 'COMPLETED', 'on-hold': 'PAUSED',
+    dropped: 'DROPPED', 'plan to watch': 'PLANNING', 'plan to read': 'PLANNING',
+  };
+  const MB_LIST_STATE = {
+    reading: 'CURRENT', rereading: 'REPEATING', completed: 'COMPLETED', dropped: 'DROPPED',
+    paused: 'PAUSED', plan_to_read: 'PLANNING', considering: 'PLANNING',
+  };
+  const LIST_STATUS_ALIASES = Object.assign({
+    current: 'CURRENT', watching: 'CURRENT', reading: 'CURRENT', repeating: 'REPEATING', rewatching: 'REPEATING',
+    rereading: 'REPEATING', completed: 'COMPLETED', complete: 'COMPLETED', paused: 'PAUSED', 'on hold': 'PAUSED',
+    'on-hold': 'PAUSED', dropped: 'DROPPED', planning: 'PLANNING', 'plan to read': 'PLANNING', 'plan to watch': 'PLANNING',
+    ptw: 'PLANNING', ptr: 'PLANNING', plan_to_read: 'PLANNING', plan_to_watch: 'PLANNING',
+  });
+  const listStatusOf = (v) => (v ? LIST_STATUS_ALIASES[String(v).trim().toLowerCase()] || null : null);
+  const isoToFuzzy = (v) => {
+    const m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(String(v || '').trim());
+    if (!m || m[1] === '0000') return { year: null, month: null, day: null };
+    return { year: +m[1], month: +m[2] || null, day: +m[3] || null };
+  };
+  // A 0–100 score in the viewer's list score format (inverse of score100).
+  function scoreFrom100(rec, v) {
+    if (!Number.isFinite(v) || v <= 0) return 0;
+    const fmt = (ownerOpts(rec) || {}).scoreFormat || 'POINT_100';
+    if (fmt === 'POINT_10_DECIMAL') return Math.round(v) / 10;
+    if (fmt === 'POINT_10') return Math.round(v / 10);
+    if (fmt === 'POINT_5') return Math.max(1, Math.round(v / 20));
+    if (fmt === 'POINT_3') return v >= 75 ? 3 : (v >= 50 ? 2 : 1);
+    return Math.round(v);
+  }
+
+  // --- MAL list export (https://myanimelist.net/panel.php?go=export) ---
+  function parseMalXml(text) {
+    const doc = new DOMParser().parseFromString(text, 'text/xml');
+    if (doc.querySelector('parsererror')) throw new Error('not a valid XML file');
+    const nodes = Array.from(doc.querySelectorAll('anime, manga'));
+    if (!nodes.length) throw new Error('no <anime> or <manga> items found');
+    const txt = (n, tag) => { const e = n.querySelector(tag); return e ? (e.textContent || '').trim() : ''; };
+    const num = (n, tag) => { const v = parseInt(txt(n, tag), 10); return Number.isFinite(v) ? v : 0; };
+    const rows = [];
+    for (const n of nodes) {
+      const anime = n.tagName.toLowerCase() === 'anime';
+      const type = anime ? 'ANIME' : 'MANGA';
+      const malId = num(n, anime ? 'series_animedb_id' : 'series_mangadb_id');
+      const title = txt(n, 'series_title');
+      if (!title) continue;
+      const status = MAL_LIST_STATUS[txt(n, 'my_status').toLowerCase()] || 'PLANNING';
+      const rereading = num(n, anime ? 'my_rewatching' : 'my_rereading') === 1;
+      rows.push({
+        title, type,
+        format: META_FORMAT_JIKAN[txt(n, 'series_type')] || (anime ? 'TV' : 'MANGA'),
+        mediaStatus: null,
+        episodes: anime ? num(n, 'series_episodes') || null : null,
+        chapters: anime ? null : num(n, 'series_chapters') || null,
+        volumes: anime ? null : num(n, 'series_volumes') || null,
+        external: { mal: malId || null },
+        list: {
+          status: rereading && status === 'COMPLETED' ? 'REPEATING' : status,
+          progress: num(n, anime ? 'my_watched_episodes' : 'my_read_chapters'),
+          progressVolumes: anime ? null : num(n, 'my_read_volumes'),
+          score100: num(n, 'my_score') * 10 || null,
+          repeat: num(n, anime ? 'my_times_watched' : 'my_times_read'),
+          notes: txt(n, 'my_comments') || null,
+          startedAt: isoToFuzzy(txt(n, 'my_start_date')),
+          completedAt: isoToFuzzy(txt(n, 'my_finish_date')),
+          private: false,
+        },
+      });
+    }
+    return rows;
+  }
+
+  // --- CSV: header row, any column order, case-insensitive names. ---
+  function parseCsv(text) {
+    const rows = [];
+    let row = [];
+    let cell = '';
+    let q = false;
+    const src = String(text || '').replace(/^﻿/, '');
+    for (let i = 0; i < src.length; i++) {
+      const c = src[i];
+      if (q) {
+        if (c === '"') { if (src[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += c;
+      } else if (c === '"') q = true;
+      else if (c === ',') { row.push(cell); cell = ''; }
+      else if (c === '\n' || c === '\r') {
+        if (c === '\r' && src[i + 1] === '\n') i++;
+        row.push(cell); cell = '';
+        if (row.some((x) => x.trim() !== '')) rows.push(row);
+        row = [];
+      } else cell += c;
+    }
+    row.push(cell);
+    if (row.some((x) => x.trim() !== '')) rows.push(row);
+    return rows;
+  }
+  const CSV_COLUMNS = {
+    title: ['title', 'name', 'series', 'series_title'], type: ['type', 'media_type', 'kind'], format: ['format'],
+    status: ['status', 'list_status', 'my_status', 'state'], progress: ['progress', 'episodes_watched', 'chapters_read', 'watched', 'read', 'my_watched_episodes', 'my_read_chapters'],
+    progressVolumes: ['progress_volumes', 'volumes_read', 'my_read_volumes'], score: ['score', 'rating', 'my_score'],
+    notes: ['notes', 'note', 'comments', 'my_comments'], startedAt: ['started', 'started_at', 'start_date', 'my_start_date'],
+    completedAt: ['completed', 'completed_at', 'finish_date', 'end_date', 'my_finish_date'], repeat: ['repeat', 'rewatches', 'rereads', 'times_watched', 'times_read'],
+    private: ['private'], cover: ['cover', 'cover_url', 'image', 'cover_image'], banner: ['banner', 'banner_url'],
+    description: ['description', 'synopsis', 'summary'], genres: ['genres', 'genre'], tags: ['tags', 'tag'], synonyms: ['synonyms', 'alt_titles', 'alternative_titles'],
+    episodes: ['episodes', 'total_episodes', 'series_episodes'], chapters: ['chapters', 'total_chapters', 'series_chapters'], volumes: ['volumes', 'total_volumes', 'series_volumes'],
+    mediaStatus: ['media_status', 'release_status', 'publishing_status', 'airing_status'], year: ['year', 'start_year', 'release_year'],
+    mal: ['mal', 'mal_id', 'myanimelist', 'series_animedb_id', 'series_mangadb_id'], mangabaka: ['mangabaka', 'mangabaka_id', 'mb_id'], anilist: ['anilist', 'anilist_id'],
+    adult: ['adult', 'is_adult', 'isadult', 'nsfw'],
+  };
+  const MEDIA_STATUS_ALIASES = {
+    finished: 'FINISHED', complete: 'FINISHED', completed: 'FINISHED', releasing: 'RELEASING', ongoing: 'RELEASING', publishing: 'RELEASING',
+    airing: 'RELEASING', 'not yet released': 'NOT_YET_RELEASED', not_yet_released: 'NOT_YET_RELEASED', upcoming: 'NOT_YET_RELEASED',
+    cancelled: 'CANCELLED', canceled: 'CANCELLED', hiatus: 'HIATUS',
+  };
+  function csvRows(text, defaultType) {
+    const table = parseCsv(text);
+    if (table.length < 2) throw new Error('needs a header row and at least one entry');
+    const norm = (h) => String(h || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+    const header = table[0].map(norm);
+    const col = {};
+    for (const [key, names] of Object.entries(CSV_COLUMNS)) {
+      const i = header.findIndex((h) => names.includes(h));
+      if (i !== -1) col[key] = i;
+    }
+    if (col.title === undefined) throw new Error('no title column (accepted: ' + CSV_COLUMNS.title.join(', ') + ')');
+    const get = (r, key) => (col[key] === undefined ? '' : String(r[col[key]] || '').trim());
+    const num = (r, key) => { const v = parseFloat(get(r, key)); return Number.isFinite(v) ? v : null; };
+    const listOf = (r, key) => get(r, key).split(/[;|]/).map((x) => x.trim()).filter(Boolean);
+    const rows = [];
+    for (const r of table.slice(1)) {
+      const title = get(r, 'title');
+      if (!title) continue;
+      const t = get(r, 'type').toUpperCase();
+      const type = t.startsWith('ANIME') ? 'ANIME' : (t.startsWith('MANGA') || t === 'NOVEL' || t === 'LN' ? 'MANGA' : defaultType);
+      const anime = type === 'ANIME';
+      const fmt = get(r, 'format').toUpperCase().replace(/[\s-]+/g, '_');
+      const genres = listOf(r, 'genres');
+      const tags = listOf(r, 'tags');
+      const bool = (v) => /^(1|true|yes|y)$/i.test(v);
+      rows.push({
+        title, type,
+        format: FORMAT_OPTS[type].includes(fmt) ? fmt : (fmt === 'LIGHT_NOVEL' || fmt === 'LN' ? 'NOVEL' : (fmt === 'ONESHOT' ? 'ONE_SHOT' : null)),
+        mediaStatus: MEDIA_STATUS_ALIASES[get(r, 'mediaStatus').toLowerCase()] || null,
+        episodes: anime ? num(r, 'episodes') : null,
+        chapters: anime ? null : num(r, 'chapters'),
+        volumes: anime ? null : num(r, 'volumes'),
+        cover: get(r, 'cover') || null, banner: get(r, 'banner') || null,
+        description: get(r, 'description') ? descToHtml(get(r, 'description')) : null,
+        genres, tags, synonyms: listOf(r, 'synonyms'),
+        year: num(r, 'year'),
+        isAdult: get(r, 'adult') ? bool(get(r, 'adult')) : undefined,
+        external: { mal: num(r, 'mal'), mangabaka: num(r, 'mangabaka'), anilist: num(r, 'anilist') },
+        list: {
+          status: listStatusOf(get(r, 'status')) || 'PLANNING',
+          progress: Math.max(0, Math.round(num(r, 'progress') || 0)),
+          progressVolumes: anime ? null : Math.max(0, Math.round(num(r, 'progressVolumes') || 0)),
+          score: num(r, 'score'), // in the viewer's own score format
+          repeat: Math.max(0, Math.round(num(r, 'repeat') || 0)),
+          notes: get(r, 'notes') || null,
+          startedAt: isoToFuzzy(get(r, 'startedAt')),
+          completedAt: isoToFuzzy(get(r, 'completedAt')),
+          private: bool(get(r, 'private')),
+        },
+      });
+    }
+    return rows;
+  }
+
+  // --- MangaBaka library: personal access token (Settings → API on
+  // mangabaka.org), scope library.read. The token is used for this import
+  // only and never stored. Series details come from the public batch
+  // endpoint so mbNormalize (and its "already on AniList" link) applies. ---
+  async function mbApi(path, token) {
+    const url = 'https://api.mangabaka.org' + path;
+    const headers = token ? { 'x-api-key': token } : {};
+    if (gmXHR) return gmJson(url, { headers });
+    const res = await nativeFetch(url, { headers });
+    if (!res.ok) throw new Error(httpErrText(res.status));
+    return res.json();
+  }
+  async function fetchMangaBakaLibrary(token, onProgress) {
+    const entries = [];
+    for (let page = 1; page <= 200; page++) {
+      if (onProgress) onProgress(`Loading MangaBaka library, page ${page}…`);
+      const j = await mbApi(`/v2/my/library?limit=100&page=${page}`, token);
+      const data = Array.isArray(j.data) ? j.data : [];
+      for (const d of data) { const e = (d && d.entry) || d || {}; const sid = e.series_id || (d && d.series && d.series.id); if (sid) entries.push(Object.assign({}, e, { series_id: sid })); }
+      if (!data.length || !(j.pagination && j.pagination.next)) break;
+    }
+    const rows = [];
+    const ids = [...new Set(entries.map((e) => e.series_id))];
+    const byId = {};
+    for (let i = 0; i < ids.length; i += 50) {
+      if (onProgress) onProgress(`Loading series details ${Math.min(i + 50, ids.length)}/${ids.length}…`);
+      const j = await mbApi('/v1/series/batch?' + ids.slice(i, i + 50).map((id) => 'id=' + id).join('&'), null);
+      for (const d of (Array.isArray(j.data) ? j.data : [])) if (d && d.id) byId[d.id] = d;
+    }
+    for (const e of entries) {
+      const d = byId[e.series_id];
+      if (!d) continue;
+      const r = mbNormalize(d);
+      rows.push(Object.assign(r, {
+        list: {
+          status: MB_LIST_STATE[e.state] || 'PLANNING',
+          progress: Math.max(0, Math.round(e.progress_chapter || 0)),
+          progressVolumes: Math.max(0, Math.round(e.progress_volume || 0)),
+          score100: Number.isFinite(e.rating) && e.rating > 0 ? e.rating : null,
+          repeat: Math.max(0, Math.round(e.number_of_rereads || 0)),
+          notes: e.note || null,
+          startedAt: isoToFuzzy(e.start_date),
+          completedAt: isoToFuzzy(e.finish_date),
+          private: !!e.is_private,
+        },
+      }));
+    }
+    return rows;
+  }
+
+  // Which of these MAL ids exist on AniList (Page.media(idMal_in), 50 a call).
+  async function anilistMalIds(type, malIds) {
+    const found = new Set();
+    const ids = [...new Set(malIds.filter((v) => Number.isFinite(v) && v > 0))];
+    for (let i = 0; i < ids.length; i += 50) {
+      const res = await nativeFetch.call(window, '/graphql', {
+        method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: 'query($ids:[Int],$type:MediaType){Page(perPage:50){media(idMal_in:$ids,type:$type){idMal}}}', variables: { ids: ids.slice(i, i + 50), type } }),
+      });
+      const j = await res.json();
+      for (const m of ((j.data && j.data.Page && j.data.Page.media) || [])) if (m && m.idMal) found.add(m.idMal);
+      if (i + 50 < ids.length) await new Promise((r) => setTimeout(r, 700));
+    }
+    return found;
+  }
+
+  // One row → one custom entry (no activity). Returns the record.
+  function importRow(row, ownerId) {
+    const list = row.list || {};
+    const rec = createRec({
+      ownerId, type: row.type, title: row.title, quiet: true,
+      format: row.format || (row.type === 'ANIME' ? 'TV' : 'MANGA'),
+      mediaStatus: row.mediaStatus || 'FINISHED',
+      status: list.status || 'PLANNING',
+      episodes: row.episodes || null, chapters: row.chapters || null, volumes: row.volumes || null,
+      cover: row.cover || DEFAULT_COVER, banner: row.banner || null,
+    });
+    applyImportToRec(rec, Object.assign({ mediaStatus: rec.media.status }, row, { format: row.format || rec.media.format, mediaStatus: row.mediaStatus || rec.media.status }));
+    const e = rec.entry;
+    if (list.progress) e.progress = list.progress;
+    if (rec.type === 'MANGA' && list.progressVolumes) e.progressVolumes = list.progressVolumes;
+    if (Number.isFinite(list.score) && list.score > 0) e.score = list.score;
+    else if (Number.isFinite(list.score100) && list.score100 > 0) e.score = scoreFrom100(rec, list.score100);
+    if (list.repeat) e.repeat = list.repeat;
+    if (list.notes) e.notes = list.notes;
+    // Dates come from the source only (no "today" stamps on a migration).
+    const empty = { year: null, month: null, day: null };
+    e.startedAt = list.startedAt && list.startedAt.year ? list.startedAt : empty;
+    e.completedAt = list.completedAt && list.completedAt.year ? list.completedAt : empty;
+    if (list.private) e.private = true;
+    rec.imported = { at: nowSec(), from: row.provider || (row.external && row.external.mal ? 'MAL' : 'CSV') };
+    touchRec(rec);
+    return rec;
+  }
+  const importedBefore = (row) => allRecs().some((r) => r.external && (
+    (row.external && row.external.mangabaka && r.external.mangabaka === row.external.mangabaka)
+    || (row.external && row.external.mal && r.type === row.type && r.external.mal === row.external.mal)));
+
+  // Runs the import: skips, creates, then (MAL rows) fills in metadata from
+  // the MAL API one entry at a time and embeds covers. onProgress(text).
+  async function runBulkImport(rows, opts, onProgress) {
+    const ownerId = opts.ownerId;
+    const out = { added: 0, onAniList: 0, dupes: 0, failed: 0, recs: [] };
+    let onAL = new Set();
+    if (opts.skipOnAniList) {
+      for (const type of ['ANIME', 'MANGA']) {
+        const ids = rows.filter((r) => r.type === type && r.external && r.external.mal && !(r.external.anilist)).map((r) => r.external.mal);
+        if (!ids.length) continue;
+        if (onProgress) onProgress(`Checking ${ids.length} ${type.toLowerCase()} entr${ids.length === 1 ? 'y' : 'ies'} against AniList…`);
+        const f = await anilistMalIds(type, ids);
+        for (const id of f) onAL.add(type + ':' + id);
+      }
+    }
+    for (const row of rows) {
+      try {
+        const ext = row.external || {};
+        if (opts.skipOnAniList && (ext.anilist || (ext.mal && onAL.has(row.type + ':' + ext.mal)))) { out.onAniList++; continue; }
+        if (importedBefore(row)) { out.dupes++; continue; }
+        out.recs.push(importRow(row, ownerId));
+        out.added++;
+      } catch (e) { out.failed++; console.warn(TAG, 'import row failed', row.title, e); }
+    }
+    saveDB();
+    // Metadata: MAL rows carry only a title; ask the MAL API for the rest.
+    const needMeta = out.recs.filter((r) => r.external && r.external.mal && !r.external.mangabaka && !r.media.description);
+    for (let i = 0; i < needMeta.length; i++) {
+      const rec = needMeta[i];
+      if (onProgress) onProgress(`Fetching details ${i + 1}/${needMeta.length}: ${rec.media.title.userPreferred}`);
+      try {
+        const j = await metaFetchJson(MAL_API + (rec.type === 'ANIME' ? 'anime/' : 'manga/') + rec.external.mal);
+        if (j && j.data) {
+          const n = jikanNormalize(j.data, rec.type === 'ANIME');
+          const keepStatus = rec.media.status;
+          applyImportToRec(rec, n);
+          if (!n.mediaStatus) rec.media.status = keepStatus;
+        }
+      } catch (e) { /* keep the bare record */ }
+      await new Promise((r) => setTimeout(r, 1100));
+    }
+    for (const rec of out.recs) embedRecImages(rec).catch(() => {});
+    saveDB();
+    if (out.added) setTimeout(() => { try { syncNow(); } catch (e) { /* not configured */ } }, 500);
+    return out;
+  }
+
+  // Read a dropped/picked file as text; .gz is gunzipped (MAL exports).
+  async function readImportFile(file) {
+    if (/\.gz$/i.test(file.name) && typeof DecompressionStream === 'function') {
+      const ds = new DecompressionStream('gzip');
+      return new Response(file.stream().pipeThrough(ds)).text();
+    }
+    return file.text();
   }
 
   // MAL names come as "Last, First"; entries show them as entered, so flip.
@@ -5502,7 +6171,8 @@
   // custom page that 404'd is re-routed there.
   function healFromStore() {
     if (!vueStore()) return;
-    for (const fn of [healUserStatistics, healSearchPages, healBacklinks, healFavourites]) {
+    try { tickNotifications(false); } catch (e) { /* best effort */ }
+    for (const fn of [healUserStatistics, healSearchPages, healBacklinks, healFavourites, healNotifications]) {
       try { fn(); } catch (e) { /* best effort */ }
     }
   }
@@ -6140,6 +6810,66 @@
       }
     });
 
+    // --- airing schedule (anime): AniList's own form only shows this
+    // section to mods, so the panel generates one locally (first episode's
+    // date/time, interval, count) into media.airingSchedule. ---
+    const schedList = el('div');
+    const schedAt = el('input', { type: 'datetime-local' });
+    const schedEvery = el('input', { type: 'number', min: '1', value: '7' });
+    const schedCount = el('input', { type: 'number', min: '1', value: String(rec.media.episodes || 12) });
+    const schedStart = el('input', { type: 'number', min: '1', value: '1' });
+    const fmtAir = (t) => new Date(t * 1000).toLocaleString(undefined, { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    const renderSched = () => {
+      schedList.textContent = '';
+      const items = airingScheduleOf(rec);
+      const now = nowSec();
+      for (const a of items) {
+        schedList.appendChild(el('div', { class: 'alce-item-row' },
+          el('div', { class: 'alce-item-text' },
+            el('div', { class: 'alce-item-title' }, `Episode ${a.episode}`),
+            el('div', { class: 'alce-item-sub' }, fmtAir(a.airingAt) + (a.airingAt <= now ? ' · aired' : ''))),
+          el('button', { class: 'alce-item-del', title: 'Remove', onclick: () => { handleSaveAiringSchedule(rec, { airingSchedule: items.filter((x) => x !== a) }); renderSched(); } }, svgIcon(ICON_TRASH)),
+        ));
+      }
+      if (!items.length) schedList.appendChild(el('div', { class: 'alce-sync-status' }, 'None. Generate one below: the entry page and home cards then show the next episode\'s countdown, and aired episodes show up in your notifications.'));
+      if (items.length) {
+        const first = items[0];
+        const d = new Date(first.airingAt * 1000);
+        const pad = (n) => String(n).padStart(2, '0');
+        schedAt.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        schedStart.value = String(first.episode);
+        schedCount.value = String(items.length);
+        if (items.length > 1) schedEvery.value = String(Math.max(1, Math.round((items[1].airingAt - first.airingAt) / 86400)));
+      }
+    };
+    const generateSched = () => {
+      const t0 = schedAt.value ? Math.floor(new Date(schedAt.value).getTime() / 1000) : NaN;
+      const every = parseInt(schedEvery.value, 10);
+      const count = parseInt(schedCount.value, 10);
+      const start = parseInt(schedStart.value, 10) || 1;
+      if (!Number.isFinite(t0)) { toast('Set the first episode\'s air date and time', true); schedAt.focus(); return; }
+      if (!(every > 0) || !(count > 0) || count > 500) { toast('Check the interval and episode count', true); return; }
+      const items = [];
+      for (let i = 0; i < count; i++) items.push({ airingAt: t0 + i * every * 86400, episode: start + i });
+      handleSaveAiringSchedule(rec, { airingSchedule: items });
+      renderSched();
+      toast(`Airing schedule saved: ${count} episode${count === 1 ? '' : 's'}`);
+    };
+    if (anime) renderSched();
+    const schedBlock = anime ? [
+      el('div', { class: 'alce-manage-title', style: 'margin-top: 16px' }, 'Airing Schedule'),
+      schedList,
+      el('div', { class: 'alce-row' },
+        field('First episode airs', schedAt),
+        field('Every (days)', schedEvery),
+        field('Episodes', schedCount),
+        field('Starting at episode', schedStart)),
+      el('div', { class: 'alce-panel-btns' },
+        el('button', { class: 'blue', onclick: generateSched }, 'Generate'),
+        el('button', { onclick: () => { if (!airingScheduleOf(rec).length) return; handleSaveAiringSchedule(rec, { airingSchedule: [] }); renderSched(); toast('Airing schedule cleared'); } }, 'Clear'),
+      ),
+    ] : [];
+
     // --- recommendations manager ---
     const itemRow = (media, fallbackName, sub, onRemove) => {
       const cover = el('div', { class: 'alce-item-cover' });
@@ -6528,6 +7258,7 @@
         el('div', { class: 'alce-panel-btns' },
           el('button', { class: 'blue', onclick: saveQuick }, 'Save'),
         ),
+        ...schedBlock,
         el('div', { class: 'alce-manage-title', style: 'margin-top: 16px' }, 'Recommendations'),
         recList,
         ...(rec.external && rec.external.mangabaka ? [el('div', { class: 'alce-panel-btns' }, recsBtn)] : []),
@@ -6806,14 +7537,18 @@
     const body = el('div', { class: 'alce-tab-body' });
     const overlay = el('div', { class: 'alce-overlay', onclick: (e) => { if (e.target === overlay) overlay.remove(); } });
     const tabs = el('div', { class: 'alce-tabs' });
+    const subtitle = () => `${allRecs().length} entr${allRecs().length === 1 ? 'y' : 'ies'} · v${window.__ALCE_VERSION || ''}`;
+    const head = modalHead('Custom Entries', overlay, subtitle);
     const modal = el('div', { class: 'alce-modal alce-modal-manage' },
-      el('div', { class: 'alce-modal-top' },
-        modalHead('Custom Entries', overlay, () => `${allRecs().length} entr${allRecs().length === 1 ? 'y' : 'ies'} · v${window.__ALCE_VERSION || ''}`),
-        tabs),
+      el('div', { class: 'alce-modal-top' }, head, tabs),
       body,
     );
     overlay.appendChild(modal);
-    const render = () => renderManage(body, overlay, tabs, render);
+    const render = () => {
+      const sub = head.querySelector('.alce-modal-sub');
+      if (sub) sub.textContent = subtitle();
+      renderManage(body, overlay, tabs, render);
+    };
     render();
     document.body.appendChild(overlay);
   }
@@ -7157,6 +7892,7 @@
   }
 
   /* --- Settings tab: toggles, account move, export / import, danger zone. --- */
+  let bulkSource = 'mal';
   function renderSettingsTab(container, rerender, section, hint, btnRow) {
     const toggle = (label, text, get, set) => {
       const chk = el('input', { type: 'checkbox' });
@@ -7258,6 +7994,86 @@
         }, 'Replace database'),
       ),
     ));
+
+    // Bulk import: MAL export / MangaBaka library / CSV → custom entries.
+    {
+      const uid = authUserId();
+      const owner = (uid && db.owners[uid]) || currentOwner();
+      const srcSel = select([['mal', 'MyAnimeList export (XML)'], ['mangabaka', 'MangaBaka library'], ['csv', 'CSV']], bulkSource);
+      const body = el('div');
+      const status = el('div', { class: 'alce-sync-status' });
+      const skipChk = el('input', { type: 'checkbox' });
+      skipChk.checked = true;
+      const skipRow = el('label', { class: 'alce-check' }, skipChk, el('span', {}, el('b', {}, 'Skip entries that exist on AniList'), el('div', { class: 'alce-check-desc' }, 'Those belong on your real list; only what AniList lacks becomes a custom entry.')));
+      const ta = el('textarea', { spellcheck: 'false' });
+      ta.style.display = 'block';
+      const fileIn = el('input', { type: 'file', accept: '.xml,.gz,.csv,.txt' });
+      fileIn.style.display = 'none';
+      fileIn.onchange = async () => {
+        const f = fileIn.files && fileIn.files[0];
+        if (!f) return;
+        try { ta.value = await readImportFile(f); status.textContent = `Loaded ${f.name}`; } catch (e) { toast(`Could not read ${f.name}: ${e.message}`, true); }
+        fileIn.value = '';
+      };
+      const tokIn = el('input', { type: 'password', placeholder: 'mb-… personal access token (library.read); used once, never stored', autocomplete: 'off' });
+      const typeSel = select([['MANGA', 'Manga'], ['ANIME', 'Anime']], 'MANGA');
+      const importBtn = el('button', { class: 'blue' }, 'Import');
+      const renderBody = () => {
+        body.textContent = '';
+        if (bulkSource === 'mal') {
+          body.append(hint('MyAnimeList → Settings → Export list. Paste the XML (or pick the .xml.gz) below. Titles, progress, scores, dates and notes carry over; details and covers are fetched from the MAL API afterwards, about one per second.'),
+            ta, btnRow(el('button', { onclick: () => fileIn.click() }, 'Choose file…')), skipRow);
+        } else if (bulkSource === 'mangabaka') {
+          body.append(hint('Reads your MangaBaka library with a personal access token (mangabaka.org → Settings → API, scope library.read). Reading state, progress, rating, dates and notes carry over.'),
+            field('Access token', tokIn), skipRow);
+        } else {
+          body.append(hint('Header row, any column order. Columns: title (required), type, format, status, progress, progress_volumes, score (in your list\'s format), notes, started_at, completed_at, repeat, private, cover, banner, description, genres, tags, synonyms (; separated), episodes, chapters, volumes, media_status, year, mal_id, mangabaka_id, anilist_id, adult.'),
+            ta, btnRow(el('button', { onclick: () => fileIn.click() }, 'Choose file…')), field('Type when the CSV has no type column', typeSel), skipRow);
+        }
+      };
+      srcSel.addEventListener('change', () => { bulkSource = srcSel.value; renderBody(); status.textContent = ''; });
+      renderBody();
+      let running = false;
+      importBtn.onclick = async () => {
+        if (running) return;
+        if (!owner) { toast('Log in first: imported entries need an account to belong to', true); return; }
+        let rows;
+        try {
+          if (bulkSource === 'mal') { if (!ta.value.trim()) { toast('Paste the export XML first', true); ta.focus(); return; } rows = parseMalXml(ta.value); }
+          else if (bulkSource === 'csv') { if (!ta.value.trim()) { toast('Paste CSV first', true); ta.focus(); return; } rows = csvRows(ta.value, typeSel.value); }
+          else {
+            const tok = tokIn.value.trim();
+            if (!tok) { toast('Paste a MangaBaka access token first', true); tokIn.focus(); return; }
+            running = true; importBtn.disabled = true; importBtn.textContent = 'Loading…';
+            rows = await fetchMangaBakaLibrary(tok, (t) => { status.textContent = t; });
+          }
+        } catch (e) {
+          running = false; importBtn.disabled = false; importBtn.textContent = 'Import';
+          toast(`Import failed: ${e.message}`, true); status.textContent = '';
+          return;
+        }
+        if (!rows.length) { running = false; importBtn.disabled = false; importBtn.textContent = 'Import'; toast('Nothing to import', true); return; }
+        running = true; importBtn.disabled = true; importBtn.textContent = 'Importing…';
+        status.textContent = `Importing ${rows.length} entr${rows.length === 1 ? 'y' : 'ies'}…`;
+        try {
+          const r = await runBulkImport(rows, { ownerId: owner.id, skipOnAniList: skipChk.checked }, (t) => { status.textContent = t; });
+          const parts = [`${r.added} added`];
+          if (r.onAniList) parts.push(`${r.onAniList} skipped (on AniList)`);
+          if (r.dupes) parts.push(`${r.dupes} already imported`);
+          if (r.failed) parts.push(`${r.failed} failed`);
+          status.textContent = 'Done: ' + parts.join(' · ') + (r.added ? '. Reload the page to see them in your list.' : '.');
+          toast(`Imported ${r.added} entr${r.added === 1 ? 'y' : 'ies'}` + (r.onAniList ? ` (${r.onAniList} already on AniList)` : ''));
+          tokIn.value = '';
+        } catch (e) {
+          status.textContent = `Import stopped: ${e.message}`;
+          toast(`Import failed: ${e.message}`, true);
+        }
+        running = false; importBtn.disabled = false; importBtn.textContent = 'Import';
+      };
+      container.appendChild(section('Bulk import',
+        field('Source', srcSel), body, fileIn, btnRow(importBtn), status,
+      ));
+    }
 
     const delAllBtn = el('button', { class: 'alce-danger' }, 'Delete All Custom Entries');
     delAllBtn.addEventListener('click', async () => {
@@ -7443,9 +8259,10 @@
     logRevision(rec, 'CREATE', { title: revisionValue(rec.media.title.userPreferred) });
     saveDB();
     // The server would create a "plans to watch/read" (or "completed")
-    // activity for a fresh entry; mirror that locally.
-    recordListActivity(rec, null, 0);
-    console.log(TAG, 'created custom entry', rec);
+    // activity for a fresh entry; mirror that locally. Bulk imports pass
+    // quiet: a migrated backlog shouldn't flood the feed.
+    if (!f.quiet) recordListActivity(rec, null, 0);
+    console.log(TAG, 'created custom entry', f.quiet ? rec.id : rec);
     return rec;
   }
 
