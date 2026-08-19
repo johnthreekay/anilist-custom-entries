@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AniList Custom Entries
 // @namespace    al-custom-entries
-// @version      1.41.4
+// @version      1.41.5
 // @description  Create fully client-side custom anime/manga entries on AniList that behave like normal list entries (rate, note, custom lists, progress, favourite, delete) via the native UI, including local activity feed entries and the home page's in-progress lists. Optionally syncs the database to a private GitHub repo for cross-device use.
 // @author       john
 // @homepageURL  https://github.com/johnthreekay/anilist-custom-entries
@@ -36,7 +36,7 @@
   const window = (typeof unsafeWindow === 'object' && unsafeWindow) ? unsafeWindow : globalThis;
 
   const TAG = '[AL-Custom]';
-  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.41.4'; } catch (e) { /* diagnostics only */ }
+  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.41.5'; } catch (e) { /* diagnostics only */ }
   const ID_BASE = 2000000000; // far above any real AniList media/entry id, still within GraphQL Int32
   const LS_KEY = 'al-custom-entries-v1';
 
@@ -798,6 +798,10 @@
     const m = Object.assign({}, rec.media, { mediaListEntry: recIsListed(rec) ? rec.id : null });
     if (m.description) m.description = sanitizeHtml(m.description);
     m.nextAiringEpisode = nextAiringOf(rec);
+    // The record keeps its studio links as a plain array (media.studios);
+    // the site reads media.studios.edges everywhere (the media page's
+    // sidebar crashes on anything else and drops its whole data block).
+    m.studios = { edges: studiosOf(rec).map((st) => ({ id: st.id, isMain: !!st.isMain, node: st.studioId })) };
     return m;
   }
 
@@ -1170,12 +1174,10 @@
     }
 
     const studioEntities = {};
-    const studioLinks = studiosOf(rec);
-    if (studioLinks.length) {
-      for (const st of studioLinks) {
-        studioEntities[st.studioId] = { id: st.studioId, name: st.name || 'Studio #' + st.studioId, isAnimationStudio: st.isAnimationStudio !== false, isFavourite: !!(db.favStudios && db.favStudios[st.studioId]) };
-      }
-      media.studios = { edges: studioLinks.map((st) => ({ id: st.id, isMain: !!st.isMain, node: st.studioId })) };
+    // media.studios.edges come from mediaEntity; the studio entities they
+    // point at are committed here.
+    for (const st of studiosOf(rec)) {
+      studioEntities[st.studioId] = { id: st.studioId, name: st.name || 'Studio #' + st.studioId, isAnimationStudio: st.isAnimationStudio !== false, isFavourite: !!(db.favStudios && db.favStudios[st.studioId]) };
     }
 
     const recommendationEntities = {};

@@ -29,5 +29,14 @@ module.exports = function () {
   fns.removeStudioLink(rec, rec.media.studios[0].id);
   fns.removeStudioLink(rec, rec.id);
   expect('removals', [rec.media.studios.length, rec.media.studioName], [0, null]);
+  // mediaEntity always serves media.studios as {edges} (the media page's
+  // sidebar reads .edges.map and drops its whole data block otherwise).
+  const { grabFunction } = require('./lib');
+  const me = evalBlock(grabFunction('mediaEntity'), {
+    enrichRecTags() {}, recIsListed: () => true, sanitizeHtml: (x) => x, nextAiringOf: () => null, studiosOf: fns.studiosOf,
+  }, ['mediaEntity']);
+  const plain = { id: 2000000014, type: 'MANGA', media: { studios: [], title: { userPreferred: 'X' } }, entry: {} };
+  const withStudio = { id: 2000000015, type: 'ANIME', media: { studioName: 'Manpuku Jinja', studios: [] }, entry: {} };
+  expect('mediaEntity studios shape', [me.mediaEntity(plain).studios, me.mediaEntity(withStudio).studios.edges.map((e) => [e.isMain, e.node === sid])], [{ edges: [] }, [[true, true]]]);
   return done();
 };
