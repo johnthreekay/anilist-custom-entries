@@ -11,7 +11,8 @@ const SRC = fs.readFileSync(path.join(__dirname, '..', 'anilist-custom-entries.u
 // functions in the script end with a line that is exactly "  }", which is
 // safer than brace counting (strings and regexes contain braces).
 function grabFunction(name) {
-  const i = SRC.indexOf(`  function ${name}(`);
+  let i = SRC.indexOf(`  function ${name}(`);
+  if (i < 0) i = SRC.indexOf(`  async function ${name}(`);
   if (i < 0) throw new Error('function not found: ' + name);
   const j = SRC.indexOf('\n  }\n', i);
   if (j < 0) throw new Error('function end not found: ' + name);

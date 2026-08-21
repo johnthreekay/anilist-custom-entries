@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AniList Custom Entries
 // @namespace    al-custom-entries
-// @version      1.41.5
+// @version      1.44.4
 // @description  Create fully client-side custom anime/manga entries on AniList that behave like normal list entries (rate, note, custom lists, progress, favourite, delete) via the native UI, including local activity feed entries and the home page's in-progress lists. Optionally syncs the database to a private GitHub repo for cross-device use.
 // @author       john
 // @homepageURL  https://github.com/johnthreekay/anilist-custom-entries
@@ -36,7 +36,7 @@
   const window = (typeof unsafeWindow === 'object' && unsafeWindow) ? unsafeWindow : globalThis;
 
   const TAG = '[AL-Custom]';
-  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.41.5'; } catch (e) { /* diagnostics only */ }
+  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.44.4'; } catch (e) { /* diagnostics only */ }
   const ID_BASE = 2000000000; // far above any real AniList media/entry id, still within GraphQL Int32
   const LS_KEY = 'al-custom-entries-v1';
 
@@ -135,6 +135,10 @@
       for (const k of ['characters', 'staff', 'relations', 'recs', 'history', 'reviews']) if (!Array.isArray(rec[k])) rec[k] = [];
       for (const k of ['genres', 'tags', 'synonyms', 'externalLinks', 'studios']) if (!Array.isArray(rec.media[k])) rec.media[k] = [];
       if (!rec.media.title || typeof rec.media.title !== 'object') rec.media.title = { userPreferred: String(rec.media.title || 'Untitled') };
+      // userPreferred follows the viewer's AniList title language (like real
+      // entries); recomputed each load so a settings change takes effect.
+      const tl = rec.media.title;
+      if (tl.romaji || tl.english || tl.native) tl.userPreferred = preferredTitleOf(tl);
     }
     d.version = DB_VERSION;
     if (from && from !== DB_VERSION) console.log(TAG, `database migrated ${from} → ${DB_VERSION}`);
@@ -2137,7 +2141,7 @@
         english: vars.title.english !== undefined ? vars.title.english : (md.title.english || null),
         native: vars.title.native !== undefined ? vars.title.native : (md.title.native || null),
       };
-      md.title.userPreferred = md.title.romaji || md.title.english || md.title.native || 'Untitled';
+      md.title.userPreferred = preferredTitleOf(md.title);
     }
     for (const k of ['description', 'format', 'status', 'genres', 'synonyms', 'source',
       'hashtag', 'countryOfOrigin', 'isAdult', 'isLicensed']) {
@@ -3714,6 +3718,7 @@
    * description (the hover bubble), adult flag. Cached for a week. --- */
   const TAG_CACHE_KEY = 'al-custom-entries-tags-v2';
   let tagCatalog = null; // Map(lowercase name → tag)
+  let tagCatalogSquashed = null; // Map(lowercase alphanumerics only → tag)
   function loadTagCatalog() {
     try {
       const raw = localStorage.getItem(TAG_CACHE_KEY);
@@ -3734,7 +3739,12 @@
   }
   function setTagCatalog(tags) {
     tagCatalog = new Map();
-    for (const t of tags) if (t && t.name) tagCatalog.set(String(t.name).toLowerCase(), t);
+    tagCatalogSquashed = new Map();
+    for (const t of tags) {
+      if (!t || !t.name) continue;
+      tagCatalog.set(String(t.name).toLowerCase(), t);
+      tagCatalogSquashed.set(tagKey(t.name), t);
+    }
     for (const rec of allRecs()) enrichRecTags(rec);
   }
   // In-memory only (no save, no sync churn): the stored record keeps just
@@ -3752,6 +3762,10 @@
     }
   }
   const catalogTag = (name) => (tagCatalog ? tagCatalog.get(String(name || '').toLowerCase()) || null : null);
+  const tagKey = (n) => String(n || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const catalogTagLoose = (name) => (name && tagCatalog
+    ? tagCatalog.get(String(name).toLowerCase()) || tagCatalogSquashed.get(tagKey(name)) || null
+    : null);
 
   // Profile / stats pages: User.statistics.{anime,manga} come straight from
   // the server, so custom entries are missing from "Chapters Read" and
@@ -4641,15 +4655,42 @@
   GENRE_CANON.set('sciencefiction', 'Sci-Fi');
   GENRE_CANON.set('magicalgirls', 'Mahou Shoujo');
   GENRE_CANON.set('magicalgirl', 'Mahou Shoujo');
+  // Provider tag vocab -> AniList vocab, for names whose exact/squashed
+  // form differs from the catalog's. An alias only applies when its target
+  // really exists in the fetched catalog (or the genre list), so a wrong
+  // guess here is a no-op, never a corruption.
+  const TAG_ALIAS = new Map(Object.entries({
+    shoujoai: 'Yuri', girlslove: 'Yuri', gl: 'Yuri', bl: "Boys' Love",
+    shounenai: "Boys' Love", boyslove: "Boys' Love", yaoi: "Boys' Love",
+    genderbender: 'Gender Bending', genderswap: 'Gender Bending',
+    schoollife: 'School', lovepolygon: 'Love Triangle',
+    '4koma': '4-koma', yonkoma: '4-koma', doujin: 'Doujinshi',
+    postapocalyptic: 'Post-Apocalyptic', timetravel: 'Time Travel',
+    suspense: 'Thriller', erotica: 'Hentai',
+  }));
+  // Canonicalize one provider tag name against AniList's tag catalog:
+  // exact match first (any casing/punctuation), then the alias table.
+  // Anything unmatched is preserved verbatim - ship tags, "Aaaaaaangst",
+  // scanlator vocab and the rest are kept, never dropped. A trailing :NN
+  // rank rides along untouched.
+  function canonTag(raw) {
+    const m = /^(.*?):(\d{1,3})$/.exec(String(raw || '').trim());
+    const name = (m ? m[1] : String(raw || '')).trim();
+    const rank = m ? ':' + m[2] : '';
+    const hit = catalogTagLoose(name) || catalogTagLoose(TAG_ALIAS.get(tagKey(name)) || '');
+    return (hit ? hit.name : tagCase(name)) + rank;
+  }
   function splitGenresTags(names) {
     const genres = [];
     const tags = [];
     for (const raw of names || []) {
       const n = String(raw || '').trim();
       if (!n) continue;
-      const g = GENRE_CANON.get(n.toLowerCase().replace(/[^a-z]/g, ''));
+      const alias = TAG_ALIAS.get(tagKey(n));
+      const g = GENRE_CANON.get(n.toLowerCase().replace(/[^a-z]/g, ''))
+        || (alias && GENRE_CANON.get(alias.toLowerCase().replace(/[^a-z]/g, '')));
       if (g) { if (!genres.includes(g)) genres.push(g); }
-      else { const t = tagCase(n); if (!tags.includes(t)) tags.push(t); }
+      else { const t = canonTag(n); if (!tags.includes(t)) tags.push(t); }
     }
     return { genres, tags };
   }
@@ -4979,6 +5020,8 @@
   }
 
   function mbNormalize(d) {
+    const mbStale = d.status === 'unknown';
+    const mbSplit = splitGenresTags([...(d.genres || []), ...(d.tags || [])]);
     const syn = [];
     if (d.native_title && d.native_title !== d.title) syn.push(d.native_title);
     if (d.romanized_title && d.romanized_title !== d.title) syn.push(d.romanized_title);
@@ -4988,27 +5031,45 @@
     const src = d.source || {};
     const fmt = d.type === 'novel' || d.type === 'light_novel' ? 'NOVEL'
       : (d.type === 'one_shot' ? 'ONE_SHOT' : 'MANGA');
-    return {
+    const row = {
       provider: 'MangaBaka',
       isAdult: mbIsAdult(d),
       malId: (src.my_anime_list && src.my_anime_list.id) || null,
       type: 'MANGA',
       title: d.title,
+      titles: (() => {
+        const rj = d.romanized_title || null;
+        const disp = d.title && !looksCjk(d.title) ? d.title : null;
+        let romaji = rj && disp && romajiScore(disp) > romajiScore(rj) ? disp : rj;
+        // The romanized field sometimes holds a fan abbreviation
+        // ("YagaKimi"); rescue the full romanization from the alt bag when
+        // the pick is junk or a camel-cased single token.
+        const toks = (s) => String(s || '').split(/\s+/).filter(Boolean).length;
+        if (!romaji || romajiScore(romaji) < 0.5 || (toks(romaji) === 1 && /[a-z][A-Z]/.test(romaji))) {
+          const cand = syn.filter((x) => !looksCjk(x) && toks(x) >= 2 && romajiScore(x) >= 0.9)
+            .sort((a, b) => toks(b) - toks(a))[0];
+          if (cand) romaji = cand;
+        }
+        const english = ((d.secondary_titles || {}).en || []).map((x) => x && x.title).filter(Boolean)[0]
+          || pickEnglishTitle(syn, romaji || d.title, d.title);
+        return { romaji, english, native: d.native_title || null };
+      })(),
       synonyms: [...new Set(syn)],
       cover: (d.cover && d.cover.raw && d.cover.raw.url) || null,
       thumb: (d.cover && ((d.cover.x150 && d.cover.x150.x1) || (d.cover.raw && d.cover.raw.url))) || null,
       banner: null,
       description: descToHtml(d.description),
       format: fmt,
-      mediaStatus: META_STATUS_MB[d.status] || 'RELEASING',
+      mediaStatus: META_STATUS_MB[d.status] || null,
       episodes: null,
-      chapters: parseInt(d.total_chapters, 10) || null,
-      volumes: parseInt(d.final_volume, 10) || null,
-      genres: (d.genres || []).map(titleCase),
-      tags: (d.tags || []).map(titleCase),
+      chapters: mbStale ? null : parseInt(d.total_chapters, 10) || null,
+      volumes: mbStale ? null : parseInt(d.final_volume, 10) || null,
+      genres: mbSplit.genres,
+      tags: mbSplit.tags,
       studio: null,
       year: d.year || null,
       authors: d.authors || [],
+      staffRows: (d.authors || []).map((n) => ({ name: n, role: null })),
       subtitle: (d.type ? titleCase(d.type) : '') + (src.anilist && src.anilist.id ? ' · already on AniList' : ''),
       external: {
         mangabaka: d.id,
@@ -5017,6 +5078,30 @@
         anilist: (src.anilist && src.anilist.id) || null,
       },
     };
+    // MangaBaka mirrors MangaUpdates, but stale records lose the release
+    // status; ask the upstream MU record directly (completed: true/false).
+    const muId = src.manga_updates && src.manga_updates.id;
+    if (mbStale && muId) {
+      row.hydrate = async () => {
+        try {
+          const mu = await muFetchJson(muId);
+          if (mu && typeof mu.completed === 'boolean') row.mediaStatus = mu.completed ? 'FINISHED' : 'RELEASING';
+        } catch (e) { /* status stays unknown */ }
+        delete row.hydrate;
+        return row;
+      };
+    }
+    return row;
+  }
+  // MangaUpdates series lookup: MB stores MU's base-36 id ("zohhbss"); the
+  // MU API wants it numeric.
+  async function muFetchJson(id) {
+    const num = /^\d+$/.test(String(id)) ? String(id) : String(parseInt(String(id), 36));
+    const url = 'https://api.mangaupdates.com/v1/series/' + num;
+    if (gmXHR) return gmJson(url);
+    const res = await nativeFetch(url, { mode: 'cors', credentials: 'omit', referrerPolicy: 'no-referrer' });
+    if (!res.ok) throw new Error(httpErrText(res.status));
+    return res.json();
   }
 
   async function searchMangaBaka(q) {
@@ -5039,6 +5124,8 @@
   }
 
   function jikanNormalize(d, anime) {
+    const jkSplit = splitGenresTags(
+      [...(d.genres || []), ...(d.demographics || []), ...(d.themes || [])].map((g) => g && g.name));
     const syn = [...(d.title_synonyms || [])];
     if (d.title_english && d.title_english !== d.title) syn.push(d.title_english);
     if (d.title_japanese) syn.push(d.title_japanese);
@@ -5048,24 +5135,26 @@
       malId: d.mal_id,
       type: anime ? 'ANIME' : 'MANGA',
       title: d.title,
+      titles: { romaji: d.title || null, english: d.title_english || pickEnglishTitle(syn, d.title, d.title), native: d.title_japanese || null },
       synonyms: [...new Set(syn)],
       cover: (d.images && d.images.jpg && (d.images.jpg.large_image_url || d.images.jpg.image_url)) || null,
       thumb: (d.images && d.images.jpg && (d.images.jpg.small_image_url || d.images.jpg.image_url)) || null,
       banner: null,
       description: descToHtml(d.synopsis),
       format: META_FORMAT_JIKAN[d.type] || (anime ? 'TV' : 'MANGA'),
-      mediaStatus: META_STATUS_JIKAN[d.status] || 'RELEASING',
+      mediaStatus: META_STATUS_JIKAN[d.status] || null,
       episodes: anime ? d.episodes || null : null,
       chapters: !anime ? d.chapters || null : null,
       volumes: !anime ? d.volumes || null : null,
-      genres: [...(d.genres || []), ...(d.demographics || [])].map((g) => g.name),
-      tags: (d.themes || []).map((g) => g.name),
+      genres: jkSplit.genres,
+      tags: jkSplit.tags,
       studio: (anime && d.studios && d.studios[0] && d.studios[0].name) || null,
       year: d.year
         || (d.published && d.published.prop && d.published.prop.from && d.published.prop.from.year)
         || (d.aired && d.aired.prop && d.aired.prop.from && d.aired.prop.from.year)
         || null,
       authors: (d.authors || []).map((a) => a.name),
+      staffRows: (d.authors || []).map((a) => ({ name: malName(a.name), role: null })),
       subtitle: d.type || '',
       external: { mal: d.mal_id },
     };
@@ -5202,6 +5291,7 @@
     completedAt: ['completed', 'completed_at', 'finish_date', 'end_date', 'my_finish_date'], repeat: ['repeat', 'rewatches', 'rereads', 'times_watched', 'times_read'],
     private: ['private'], cover: ['cover', 'cover_url', 'image', 'cover_image'], banner: ['banner', 'banner_url'],
     description: ['description', 'synopsis', 'summary'], genres: ['genres', 'genre'], tags: ['tags', 'tag'], synonyms: ['synonyms', 'alt_titles', 'alternative_titles'],
+    titleRomaji: ['romaji', 'romaji_title', 'title_romaji'], titleEnglish: ['english', 'english_title', 'title_english'], titleNative: ['native', 'native_title', 'title_native', 'japanese', 'title_japanese'],
     episodes: ['episodes', 'total_episodes', 'series_episodes'], chapters: ['chapters', 'total_chapters', 'series_chapters'], volumes: ['volumes', 'total_volumes', 'series_volumes'],
     mediaStatus: ['media_status', 'release_status', 'publishing_status', 'airing_status'], year: ['year', 'start_year', 'release_year'],
     mal: ['mal', 'mal_id', 'myanimelist', 'series_animedb_id', 'series_mangadb_id'], mangabaka: ['mangabaka', 'mangabaka_id', 'mb_id'], anilist: ['anilist', 'anilist_id'],
@@ -5239,6 +5329,7 @@
       const bool = (v) => /^(1|true|yes|y)$/i.test(v);
       rows.push({
         title, type,
+        titles: { romaji: get(r, 'titleRomaji') || null, english: get(r, 'titleEnglish') || null, native: get(r, 'titleNative') || null },
         format: FORMAT_OPTS[type].includes(fmt) ? fmt : (fmt === 'LIGHT_NOVEL' || fmt === 'LN' ? 'NOVEL' : (fmt === 'ONESHOT' ? 'ONE_SHOT' : null)),
         mediaStatus: MEDIA_STATUS_ALIASES[get(r, 'mediaStatus').toLowerCase()] || null,
         episodes: anime ? num(r, 'episodes') : null,
@@ -5360,10 +5451,107 @@
     touchRec(rec);
     return rec;
   }
-  const importedBefore = (row) => allRecs().some((r) => r.external && (
+  const findImportedRec = (row) => allRecs().find((r) => r.external && (
     (row.external && row.external.mangabaka && r.external.mangabaka === row.external.mangabaka)
     || (row.external && row.external.mal && r.type === row.type && r.external.mal === row.external.mal)));
+  const importedBefore = (row) => !!findImportedRec(row);
 
+  // Pre-1.42 imports stored the display title in every language field, with
+  // the real romaji/native titles as synonyms. Detect and fix those records
+  // (userPreferred then follows the viewer's title language).
+  const titleFlattened = (rec) => rec.media.title.english === rec.media.title.userPreferred && rec.media.title.native === rec.media.title.userPreferred;
+  function applyTitleFix(rec, row) {
+    const md = rec.media;
+    const old = md.title;
+    const nt = importTitleObj(row);
+    // A refetch adds or corrects languages but never erases one the record
+    // already has (a distinct value may have been set by hand); mirrored
+    // pre-1.42 copies of the display title don't count.
+    const keep = (k) => (old[k] && old[k] !== old.userPreferred ? old[k] : null);
+    const tt = row.titles || {};
+    if (!tt.romaji && keep('romaji')) nt.romaji = keep('romaji');
+    if (!nt.english) nt.english = keep('english');
+    if (!nt.native) nt.native = keep('native');
+    nt.userPreferred = preferredTitleOf(nt);
+    md.title = nt;
+    md.synonyms = stripTitleSynonyms(md.synonyms, md.title);
+    touchRec(rec);
+  }
+  /* --- Staff / character auto-linking + enrichment --------------------
+   * Local staff and characters created by imports can often be linked to
+   * their real AniList counterparts (a Touhou doujin's Reimu exists on
+   * AniList with an image and a page). Linking is conservative on purpose,
+   * a wrong link is worse than none: the name must match exactly (either
+   * word order, or a listed alternative / native name), exactly ONE search
+   * candidate may match, and single-token staff names (doujin circles, pen
+   * handles) never link. Lookups are batched as aliased GraphQL fields (one
+   * request per ~14 names). Links are revision-logged and reversible in the
+   * native staff / character forms. */
+  const nameKey = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  function pickPersonMatch(name, candidates) {
+    const w = nameKey(name).split(' ');
+    const orders = [w.join(' '), w.slice().reverse().join(' ')];
+    const hits = (candidates || []).filter((cand) => {
+      const n = cand && cand.name;
+      if (!n) return false;
+      return [n.full, n.native, n.userPreferred, ...(Array.isArray(n.alternative) ? n.alternative : [])]
+        .filter(Boolean).map(nameKey).some((x) => orders.includes(x));
+    });
+    return hits.length === 1 ? hits[0] : null;
+  }
+  const staffLinkable = (s) => !!(s && isCustomId(s.staffId) && s.name && nameKey(s.name.userPreferred).split(' ').length >= 2);
+  async function alQuery(query) {
+    const res = await nativeFetch.call(window, '/graphql', {
+      method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query }),
+    });
+    const j = await res.json();
+    return (j && j.data) || {};
+  }
+  async function resolveRecPeople(rec) {
+    const out = { staffLinked: 0, charsLinked: 0, looked: 0 };
+    const staff = (rec.staff || []).filter(staffLinkable);
+    const chars = (rec.characters || []).filter((c) => c && isCustomId(c.id) && c.name);
+    const fields = [];
+    staff.forEach((s, i) => fields.push(`s${i}:Page(perPage:6){staff(search:${JSON.stringify(String(s.name.userPreferred))}){id name{first middle last full native userPreferred alternative}image{large}language:languageV2 primaryOccupations}}`));
+    chars.forEach((c, i) => fields.push(`c${i}:Page(perPage:6){characters(search:${JSON.stringify(String(c.name))}){id name{full native userPreferred alternative}image{large}}}`));
+    if (!fields.length) return out;
+    out.looked = fields.length;
+    const data = {};
+    for (let i = 0; i < fields.length; i += 14) {
+      Object.assign(data, await alQuery('query{' + fields.slice(i, i + 14).join(' ') + '}'));
+      if (i + 14 < fields.length) await new Promise((r) => setTimeout(r, 700));
+    }
+    staff.forEach((s, i) => {
+      const hit = pickPersonMatch(s.name.userPreferred, (data['s' + i] || {}).staff);
+      if (!hit) return;
+      s.staffId = hit.id;
+      s.name = Object.assign({}, hit.name, { alternative: (hit.name && hit.name.alternative) || [] });
+      s.image = (hit.image && hit.image.large) || s.image;
+      s.language = hit.language || s.language;
+      s.occupations = hit.primaryOccupations || [];
+      delete s.isCustom;
+      out.staffLinked++;
+    });
+    chars.forEach((c, i) => {
+      const hit = pickPersonMatch(c.name, (data['c' + i] || {}).characters);
+      if (!hit) return;
+      c.id = hit.id;
+      c.name = (hit.name && (hit.name.userPreferred || hit.name.full)) || c.name;
+      c.image = (hit.image && hit.image.large) || c.image;
+      out.charsLinked++;
+    });
+    if (out.staffLinked || out.charsLinked) {
+      logRevision(rec, 'EDIT', Object.assign({},
+        out.staffLinked ? { staff: 'Modified' } : {},
+        out.charsLinked ? { characters: 'Modified' } : {}));
+      touchRec(rec);
+      saveDB();
+      pushRecEntities(rec);
+      console.log(TAG, 'auto-linked', out.staffLinked, 'staff /', out.charsLinked, 'characters on', rec.media.title.userPreferred);
+    }
+    return out;
+  }
   // Runs the import: skips, creates, then (MAL rows) fills in metadata from
   // the MAL API one entry at a time and embeds covers. onProgress(text).
   async function runBulkImport(rows, opts, onProgress) {
@@ -5383,7 +5571,9 @@
       try {
         const ext = row.external || {};
         if (opts.skipOnAniList && (ext.anilist || (ext.mal && onAL.has(row.type + ':' + ext.mal)))) { out.onAniList++; continue; }
-        if (importedBefore(row)) { out.dupes++; continue; }
+        const dup = findImportedRec(row);
+        if (dup) { if (row.titles && titleFlattened(dup)) applyTitleFix(dup, row); out.dupes++; continue; }
+        if (row.hydrate) { try { await row.hydrate(); } catch (e) { /* import what we have */ } }
         out.recs.push(importRow(row, ownerId));
         out.added++;
       } catch (e) { out.failed++; console.warn(TAG, 'import row failed', row.title, e); }
@@ -5401,6 +5591,10 @@
           const keepStatus = rec.media.status;
           applyImportToRec(rec, n);
           if (!n.mediaStatus) rec.media.status = keepStatus;
+        }
+        if (rec.type === 'MANGA') {
+          const mb = await mbByMalId(rec.external.mal, rec.media.title.userPreferred);
+          if (mb) { mergeExternal(rec, mb.external); mergeTagsFrom(rec, mb); }
         }
       } catch (e) { /* keep the bare record */ }
       await new Promise((r) => setTimeout(r, 1100));
@@ -5451,6 +5645,9 @@
     const a = d.attributes || {};
     const rels = d.relationships || [];
     const title = mdText(a.title);
+    const t0 = a.title || {};
+    const altT = (lang) => { for (const x of a.altTitles || []) { if (x && x[lang]) return x[lang]; } return null; };
+    const altVals = (a.altTitles || []).flatMap((x) => Object.values(x || {}));
     const syn = [];
     for (const t of a.altTitles || []) { const v = mdText(t); if (v && v !== title) syn.push(v); }
     const groups = { genre: [], theme: [], format: [], content: [] };
@@ -5463,9 +5660,15 @@
     const oneShot = groups.format.includes('Oneshot');
     const coverRel = rels.find((r) => r.type === 'cover_art' && r.attributes && r.attributes.fileName);
     const cover = coverRel ? `https://uploads.mangadex.org/covers/${d.id}/${coverRel.attributes.fileName}` : null;
-    const authors = rels
-      .filter((r) => (r.type === 'author' || r.type === 'artist') && r.attributes && r.attributes.name)
-      .map((r) => r.attributes.name);
+    const staffRoles = new Map();
+    for (const rl of rels) {
+      if ((rl.type === 'author' || rl.type === 'artist') && rl.attributes && rl.attributes.name) {
+        const set = staffRoles.get(rl.attributes.name) || new Set();
+        set.add(rl.type);
+        staffRoles.set(rl.attributes.name, set);
+      }
+    }
+    const authors = [...staffRoles.keys()];
     const links = a.links || {};
     const finished = a.status === 'completed';
     return {
@@ -5474,13 +5677,23 @@
       malId: intId(links.mal),
       type: 'MANGA',
       title,
+      // MangaDex language tags are unreliable: a CJK-dominant title is
+      // native whatever its tag says, and an "en"-tagged one that scans as
+      // Hepburn is the romanized title, not English.
+      titles: (() => {
+        const enCands = [t0.en, altT('en')].filter((v) => v && !looksCjk(v));
+        const romaji = t0['ja-ro'] || altT('ja-ro') || enCands.find((v) => romajiScore(v) >= 0.5) || null;
+        const english = enCands.filter((v) => romajiScore(v) < 0.5)[0]
+          || pickEnglishTitle(altVals, romaji || title, title);
+        return { romaji, english, native: t0.ja || altT('ja') || altVals.filter(looksCjk)[0] || null };
+      })(),
       synonyms: [...new Set(syn)],
       cover,
       thumb: cover ? cover + '.256.jpg' : null,
       banner: null,
       description: descToHtml(mdText(a.description)),
       format: oneShot ? 'ONE_SHOT' : 'MANGA',
-      mediaStatus: MD_STATUS[a.status] || 'RELEASING',
+      mediaStatus: MD_STATUS[a.status] || null,
       episodes: null,
       chapters: finished ? (parseInt(a.lastChapter, 10) || (oneShot ? 1 : null)) : null,
       volumes: finished ? (parseInt(a.lastVolume, 10) || null) : null,
@@ -5488,7 +5701,9 @@
       tags: [...split.tags, ...groups.format.filter((f) => f !== 'Oneshot')],
       studio: null,
       year: a.year || null,
-      authors: [...new Set(authors)],
+      authors,
+      staffRows: [...staffRoles].map(([name, roles]) => ({
+        name, role: roles.size > 1 ? 'Story & Art' : (roles.has('author') ? 'Story' : 'Art') })),
       subtitle: (groups.format.includes('Doujinshi') ? 'Doujinshi' : (oneShot ? 'One-shot' : 'Manga'))
         + (links.al ? ' · already on AniList' : ''),
       external: { mangadex: d.id, mal: intId(links.mal), anilist: intId(links.al) },
@@ -5530,7 +5745,7 @@
       : (d.cover ? DYN + String(d.cover).replace('/medium/', '/original/') : null);
     const released = chapter ? d.released_on
       : (chapters.map((c) => c.released_on).filter(Boolean).sort()[0] || null);
-    const status = chapter ? 'FINISHED' : (DYN_STATUS[dynTags(d.tags, 'Status')[0]] || 'RELEASING');
+    const status = chapter ? 'FINISHED' : (DYN_STATUS[dynTags(d.tags, 'Status')[0]] || (kind === 'anthologies' ? 'FINISHED' : null));
     const finished = status === 'FINISHED';
     const facts = [];
     if (doujin.length) facts.push(doujin.join(', ') + ' doujin');
@@ -5544,6 +5759,16 @@
       malId: null,
       type: 'MANGA',
       title: chapter ? d.title : d.name,
+      // Dynasty has no language tags; classify the title and aliases by
+      // script (Hepburn-scanning -> romaji, CJK -> native, rest -> English).
+      titles: (() => {
+        const all = [chapter ? d.title : d.name, ...(d.aliases || [])].filter(Boolean);
+        return {
+          romaji: all.find((v) => !looksCjk(v) && romajiScore(v) >= 0.5) || null,
+          english: all.find((v) => !looksCjk(v) && romajiScore(v) < 0.5) || null,
+          native: all.find((v) => looksCjk(v)) || null,
+        };
+      })(),
       synonyms: (d.aliases || []).slice(),
       cover,
       thumb: cover,
@@ -5566,6 +5791,7 @@
       studio: null,
       year: released ? parseInt(String(released).slice(0, 4), 10) || null : null,
       authors: dynTags(d.tags, 'Author'),
+      staffRows: dynTags(d.tags, 'Author').map((n) => ({ name: n, role: null })),
       subtitle: [DYN_KIND_LABEL[kind], doujin.length ? doujin[0] + ' doujin' : null].filter(Boolean).join(' · '),
       external: { dynasty: kind + '/' + slug },
     };
@@ -5625,13 +5851,21 @@
   const RDB = 'https://ranobedb.org';
   const RDB_STATUS = {
     ongoing: 'RELEASING', completed: 'FINISHED', hiatus: 'HIATUS', stalled: 'HIATUS',
-    cancelled: 'CANCELLED', unknown: 'RELEASING',
+    cancelled: 'CANCELLED',
   };
   const rdbImg = (img) => (img && img.filename ? 'https://images.ranobedb.org/' + img.filename : null);
   const rdbYear = (n) => { const y = parseInt(String(n || '').slice(0, 4), 10); return y > 1000 && y < 9000 ? y : null; };
   // RanobeDB's `title` is in the series' display language; AniList-style
   // userPreferred is romaji, so use that unless the display title is English.
   const rdbTitle = (s) => ((s.lang === 'en' && s.title) || s.romaji || s.title || s.romaji_orig || s.title_orig || '');
+  const rdbTitles = (s) => {
+    const en = (s.titles || []).find((x) => x && x.lang === 'en');
+    return {
+      romaji: s.romaji_orig || s.romaji || null,
+      english: (s.lang === 'en' ? s.title : null) || (en && en.title) || null,
+      native: s.title_orig || (s.lang && s.lang !== 'en' ? s.title : null) || null,
+    };
+  };
 
   function rdbLite(s) {
     const cover = rdbImg(s.book && s.book.image);
@@ -5642,6 +5876,7 @@
       malId: null,
       type: 'MANGA',
       title,
+      titles: rdbTitles(s),
       synonyms: [...new Set([s.romaji, s.romaji_orig, s.title_orig].filter((x) => x && x !== title))],
       cover,
       thumb: cover,
@@ -5666,14 +5901,22 @@
   function rdbFull(j, coverFromSearch) {
     const s = j.series || j;
     const title = rdbTitle(s);
-    const status = RDB_STATUS[s.publication_status] || 'RELEASING';
+    const status = RDB_STATUS[s.publication_status] || null;
     const split = splitGenresTags((s.tags || []).filter((t) => t.ttype === 'genre').map((t) => t.name));
-    const tags = (s.tags || []).filter((t) => t.ttype !== 'genre').map((t) => tagCase(t.name));
+    const tags = (s.tags || []).filter((t) => t.ttype !== 'genre').map((t) => canonTag(t.name));
     const titles = (s.titles || []).flatMap((t) => [t.title, t.romaji]);
     const aliases = String(s.aliases || '').split('\n');
-    const staff = (s.staff || [])
-      .filter((x) => x.role_type === 'author' || x.role_type === 'artist')
-      .map((x) => x.romaji || x.name).filter(Boolean);
+    const staffRows = [];
+    for (const x of s.staff || []) {
+      if (x.role_type !== 'author' && x.role_type !== 'artist') continue;
+      const nm = x.romaji || x.name;
+      if (!nm) continue;
+      const role = x.role_type === 'author' ? 'Story' : 'Illustration';
+      const prev = staffRows.find((y) => y.name === nm);
+      if (prev) { if (prev.role !== role) prev.role = 'Story & Illustration'; }
+      else staffRows.push({ name: nm, native: x.romaji && x.name && x.name !== x.romaji ? x.name : null, role });
+    }
+    const staff = staffRows.map((x) => x.name);
     const books = s.books || [];
     const cover = rdbImg(books[0] && books[0].image) || coverFromSearch;
     return {
@@ -5682,6 +5925,7 @@
       malId: intId(s.mal_id),
       type: 'MANGA',
       title,
+      titles: rdbTitles(s),
       synonyms: [...new Set([s.romaji, s.romaji_orig, s.title_orig, ...titles, ...aliases]
         .map((x) => (x || '').trim()).filter((x) => x && x !== title))],
       cover,
@@ -5699,6 +5943,7 @@
       studio: null,
       year: rdbYear(s.start_date || s.c_start_date),
       authors: [...new Set(staff)],
+      staffRows,
       subtitle: 'Light Novel' + (s.anilist_id ? ' · already on AniList' : ''),
       external: { ranobedb: s.id, mal: intId(s.mal_id), anilist: intId(s.anilist_id) },
     };
@@ -5831,9 +6076,13 @@
   .alce-side-btn:hover { opacity: .85; }
   .alce-gear-btn { font-size: 15px; }
   .alce-side-btn svg { height: 14px; width: 14px; color: #fff; vertical-align: middle; margin: 0; }
-  /* Native controls that are dead ends on a custom entry: the submission
-     Edit link (ours replaces it), the Stats/Social tabs, and the
-     always-empty Threads section. (Write Review works: reviews are local.) */
+  /* Native controls that are dead ends on a custom entry: the sidebar Edit
+     link (functionally identical to our "Edit Custom Entry" button - both
+     open /edit/<type>/<id>), the Stats/Social tabs, and the always-empty
+     Threads section. Write Review stays: reviews are local. The Edit link's
+     classes are "review button edit", so .edit alone must be targeted -
+     pre-review versions hid a.review.button, which caught both. */
+  html.alce-custom-media .sidebar a.review.button.edit { display: none; }
   html.alce-custom-media .nav .link[href$="/stats"],
   html.alce-custom-media .nav .link[href$="/social"] { display: none; }
   html.alce-custom-media .grid-section-wrap > div:has(> .threads) { display: none; }
@@ -6244,8 +6493,26 @@
   // character / staff / studio backlinks, profile favourites. Lists, home
   // previews and feeds are repaired by selfHeal (timed after load), and a
   // custom page that 404'd is re-routed there.
+  // Real entries follow a title-language change instantly (the server
+  // computes userPreferred per request); recompute custom entries on the
+  // tick too, so they keep up without a full page reload.
+  let lastTitleLang = viewerTitleLang();
+  function tickTitleLanguage() {
+    const lang = viewerTitleLang();
+    if (lang === lastTitleLang) return;
+    lastTitleLang = lang;
+    for (const rec of allRecs()) {
+      const t = rec.media.title;
+      if (t.romaji || t.english || t.native) t.userPreferred = preferredTitleOf(t);
+    }
+    saveDB({ noSync: true });
+    for (const rec of allRecs()) { try { pushRecEntities(rec); } catch (e) { /* best effort */ } }
+    console.log(TAG, 'title language changed to', lang, '- recomputed custom entry titles');
+  }
+
   function healFromStore() {
     if (!vueStore()) return;
+    try { tickTitleLanguage(); } catch (e) { /* best effort */ }
     try { tickNotifications(false); } catch (e) { /* best effort */ }
     for (const fn of [healUserStatistics, healSearchPages, healBacklinks, healFavourites, healNotifications]) {
       try { fn(); } catch (e) { /* best effort */ }
@@ -6670,14 +6937,164 @@
     };
   }
 
+  // Import rows may carry per-language titles ({romaji, english, native});
+  // the row's `title` stays the provider's display title, which becomes
+  // userPreferred. Titles promoted into their own field are kept out of the
+  // synonym list (pre-1.42 imports flattened every language to the display
+  // title and left the real romaji/native titles as synonyms).
+  const looksCjk = (s) => ((String(s).match(/[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uac00-\ud7af]/g) || []).length >= Math.max(2, String(s).replace(/\s+/g, '').length * 0.3));
+  // How much of a latin-script title scans as Hepburn romaji: the fraction
+  // of its words built purely from Japanese romanization syllables
+  // ("kazami yuuka no hidamari hatake" -> 1, "flower master" -> 0). Used to
+  // pick the real romaji when a source's romanized field holds an English
+  // alt title instead (common on MangaBaka doujin entries).
+  const HEPBURN_WORD = /^(?:n|(?:(?:kk|ss|tt|pp|ssh|tch|tts|sh|ch|ts|[kgsztdnhbpmr]y|[kgsztdnhbpmyrwfj])?[aeiou]{1,3}(?:n(?![aeiouy]))?)+)$/i;
+  // English function words that also scan as Hepburn ("Bloom Into You"
+  // would score 0.67 without this); "no"/"to"/"wa" stay out - they are the
+  // particles that make romaji recognizable in the first place.
+  const ENGLISH_HINTS = new Set(['the', 'a', 'an', 'of', 'and', 'or', 'is', 'are', 'was', 'were',
+    'be', 'been', 'you', 'your', 'yours', 'into', 'onto', 'in', 'on', 'at', 'it', 'its', 'this',
+    'that', 'these', 'those', 'with', 'from', 'for', 'will', 'she', 'he', 'they', 'we', 'my',
+    'me', 'one', 'who', 'what', 'when', 'how', 'why', 'not', 'name']);
+  function romajiScore(s) {
+    const words = String(s || '').toLowerCase().replace(/['']/g, '')
+      .split(/[^a-z]+/).filter((w) => w.length >= 2 && w !== 'dj');
+    if (!words.length) return 0;
+    return words.filter((w) => !ENGLISH_HINTS.has(w) && HEPBURN_WORD.test(w)).length / words.length;
+  }
+  // Choose an English title from an untyped bag of alt titles (MangaBaka
+  // doujin entries type everything "unknown"): among the non-CJK,
+  // non-romaji candidates, the one sharing the most tokens with the
+  // romaji/display title wins (long vowels collapse so Yuuka matches
+  // Yuka's), shorter titles first on ties. Null when nothing overlaps at
+  // all; a wild guess is worse than no English title.
+  function pickEnglishTitle(cands, romaji, display) {
+    const norm = (s) => String(s || '').toLowerCase().replace(/['\u2019]s(?![a-z])/g, '').replace(/['\u2019]/g, '');
+    const collapse = (w) => w.replace(/([aeiou])\1+/g, '$1').replace(/ou/g, 'o');
+    const toks = (s) => [...new Set(norm(s).split(/[^a-z]+/).filter((w) => w.length >= 3).map(collapse))];
+    const skip = new Set([romaji, display].filter(Boolean));
+    const list = [...new Set(cands || [])].filter((c) => c && !skip.has(c) && !looksCjk(c) && romajiScore(c) < 0.5);
+    const ref = new Set([...toks(romaji || ''), ...toks(display || '')]);
+    let best = null;
+    for (const c of list) {
+      const words = norm(c).split(/[^a-z]+/).filter(Boolean).length;
+      const score = toks(c).filter((w) => ref.has(w)).length;
+      if (score < 1) continue;
+      if (!best || score > best.score || (score === best.score && words < best.words)) best = { title: c, score, words };
+    }
+    return best ? best.title : null;
+  }
+  // The viewer's Settings -> Anime & Manga -> Title Language, as AniList
+  // stores it ('ROMAJI'/'ENGLISH'/'NATIVE', possibly _STYLISED).
+  function viewerTitleLang() {
+    try {
+      const a = JSON.parse(localStorage.getItem('auth'));
+      return String((a && a.options && a.options.titleLanguage) || 'ROMAJI').toUpperCase().replace('_STYLISED', '');
+    } catch (e) { return 'ROMAJI'; }
+  }
+  // AniList's userPreferred: the title in the viewer's title language,
+  // falling back to romaji (then anything non-empty).
+  function preferredTitleOf(t) {
+    const lang = viewerTitleLang();
+    return (lang === 'ENGLISH' ? t.english : (lang === 'NATIVE' ? t.native : t.romaji))
+      || t.romaji || t.english || t.native || t.userPreferred || 'Untitled';
+  }
+  function importTitleObj(r, display) {
+    const tt = r.titles || {};
+    const t = display || r.title;
+    let english = tt.english || null;
+    let native = tt.native || null;
+    // Sources sometimes mislabel a CJK title as English (common on
+    // MangaDex doujin entries); a CJK-dominant "english" is really native.
+    if (english && looksCjk(english)) {
+      if (!native) native = english;
+      english = null;
+    }
+    const title = { romaji: tt.romaji || t, english, native };
+    // A display title distinct from the romaji that is neither CJK nor
+    // romaji-scanning is the English title (sources with a proper romaji
+    // usually surface their licensed/translated title as the display one).
+    if (!title.english && t && t !== title.romaji && !looksCjk(t) && romajiScore(t) < 0.5) title.english = t;
+    title.userPreferred = preferredTitleOf(title);
+    return title;
+  }
+  function stripTitleSynonyms(syn, title) {
+    const t = new Set([title.userPreferred, title.romaji, title.english, title.native].filter(Boolean));
+    return [...new Set(syn || [])].filter((s) => s && !t.has(s));
+  }
+
+  // Provider external-id maps carry nulls for ids they don't know; merging
+  // those verbatim would erase ids learned from other sources.
+  function mergeExternal(rec, ext) {
+    const out = Object.assign({}, rec.external);
+    for (const [k, v] of Object.entries(ext || {})) if (v !== null && v !== undefined) out[k] = v;
+    rec.external = out;
+  }
+  // Fill rec.staff from an import row - only when the record has none, so
+  // user-curated staff is never clobbered. Rows keep provider roles
+  // (MangaDex author/artist, RanobeDB author/illustrator); sources without
+  // roles get "Story & Art" for a solo author and no role otherwise.
+  function importStaff(rec, r) {
+    if ((rec.staff || []).length) return 0;
+    const rows = ((r.staffRows && r.staffRows.length ? r.staffRows
+      : (r.authors || []).map((n) => ({ name: n, role: null })))).filter((x) => x && x.name);
+    if (!rows.length) return 0;
+    const solo = rows.length === 1;
+    rec.staff = rows.map((x) => {
+      db.seq += 2;
+      return {
+        id: ID_BASE + db.seq - 1, staffId: ID_BASE + db.seq, isCustom: true,
+        role: x.role || (solo ? 'Story & Art' : null),
+        name: { first: null, middle: null, last: null, native: x.native || null,
+          full: x.name, userPreferred: x.name, alternative: [] },
+        image: null, language: null,
+      };
+    });
+    return rows.length;
+  }
+
+  // Add-only union of genres/tags from a richer linked source: never
+  // removes or re-ranks anything already on the record.
+  function mergeTagsFrom(rec, row) {
+    const md = rec.media;
+    let added = 0;
+    md.genres = md.genres || [];
+    md.tags = md.tags || [];
+    for (const g of row.genres || []) if (!md.genres.includes(g)) { md.genres.push(g); added++; }
+    const have = new Set(md.tags.map((t) => String(t.name).toLowerCase()));
+    let ri = md.tags.length;
+    for (const t of parseTags((row.tags || []).join(', '))) {
+      if (have.has(String(t.name).toLowerCase())) continue;
+      if (t.rank === 100) t.rank = Math.max(40, 90 - 2 * ri);
+      ri++;
+      md.tags.push(t);
+      added++;
+    }
+    return added;
+  }
+  // MAL's taxonomy is tiny (about twenty genres plus a few themes, and
+  // doujins often carry nothing), so MAL-sourced entries chase their
+  // MangaBaka record - found via a title search and verified by exact MAL
+  // id - for the richer MangaUpdates-derived tags and the source ids.
+  async function mbByMalId(malId, title) {
+    if (!malId || !title) return null;
+    try {
+      const j = await metaFetchJson('https://api.mangabaka.org/v1/series/search?q=' + encodeURIComponent(title));
+      for (const d of (j.data || [])) {
+        if (d && d.state !== 'merged' && d.source && d.source.my_anime_list
+          && parseInt(d.source.my_anime_list.id, 10) === parseInt(malId, 10)) return mbNormalize(d);
+      }
+    } catch (e) { /* no chase */ }
+    return null;
+  }
+
   // Apply an import pick straight to the record (the edit page saves
   // immediately; the form is just a preview that can refine afterwards).
   function applyImportToRec(rec, r) {
     const md = rec.media;
-    const t = r.title;
-    md.title = { userPreferred: t, romaji: t, english: t, native: t };
+    md.title = importTitleObj(r);
     if (FORMAT_OPTS[rec.type].includes(r.format)) md.format = r.format;
-    md.status = r.mediaStatus;
+    if (r.mediaStatus) md.status = r.mediaStatus;
     if (rec.type === 'ANIME') {
       if (r.episodes) md.episodes = r.episodes;
     } else {
@@ -6687,14 +7104,21 @@
     if (r.cover) setCover(md, r.cover, r.cover);
     if (r.description) md.description = r.description;
     if (r.genres && r.genres.length) md.genres = r.genres.slice();
-    if (r.tags && r.tags.length) md.tags = parseTags(r.tags.join(', '));
+    if (r.tags && r.tags.length) {
+      md.tags = parseTags(r.tags.join(', '));
+      // Provider tags carry no relevance votes: unranked ones get a gentle
+      // descending band (source order) instead of a wall of 100%s.
+      let ri = 0;
+      for (const tg of md.tags) if (tg.rank === 100) tg.rank = Math.max(40, 90 - 2 * (ri++));
+    }
     if (rec.type === 'ANIME' && r.studio) md.studioName = r.studio;
-    md.synonyms = r.synonyms || [];
+    md.synonyms = stripTitleSynonyms(r.synonyms, md.title);
     if (r.year && !(md.startDate && md.startDate.year)) {
       md.startDate = { year: r.year, month: null, day: null };
     }
     if (r.isAdult !== undefined) md.isAdult = !!r.isAdult;
-    rec.external = Object.assign({}, rec.external, r.external);
+    mergeExternal(rec, r.external);
+    importStaff(rec, r);
     touchRec(rec);
     saveDB();
   }
@@ -6773,7 +7197,21 @@
           bv === EMBEDDED ? md.bannerImage : embedIfHotlinkBlocked(bv || null, 'banner'),
         ]);
         const t = title.value.trim() || md.title.userPreferred;
-        md.title = { userPreferred: t, romaji: t, english: t, native: t };
+        // Quick edit's single field shows userPreferred, so typing edits the
+        // title in the viewer's title language (per-language fine-tuning
+        // lives in the native form below). Fields that merely mirrored the
+        // old display title (pre-1.42 imports flattened all four) collapse.
+        const oldT = md.title;
+        const nt = {
+          romaji: !oldT.romaji || oldT.romaji === oldT.userPreferred ? null : oldT.romaji,
+          english: !oldT.english || oldT.english === oldT.userPreferred ? null : oldT.english,
+          native: !oldT.native || oldT.native === oldT.userPreferred ? null : oldT.native,
+        };
+        const lang = viewerTitleLang();
+        nt[lang === 'ENGLISH' ? 'english' : (lang === 'NATIVE' ? 'native' : 'romaji')] = t;
+        if (!nt.romaji && !nt.english && !nt.native) nt.romaji = t;
+        nt.userPreferred = preferredTitleOf(nt);
+        md.title = nt;
         md.format = format.value;
         md.status = mediaStatus.value;
         if (anime) md.episodes = intOrNull(eps.value);
@@ -6865,7 +7303,20 @@
       covers.setSeries(rec.external && rec.external.mangabaka);
       pushRecEntities(rec);
       const base = `Imported "${r.title}" from ${r.provider} and saved.`;
-      if (!r.malId) { ui.setStatus(base); return; }
+      if (r.provider === 'MAL' && r.malId && !(rec.external && rec.external.mangabaka)) {
+        mbByMalId(r.malId, r.title).then((row) => {
+          if (!row) return;
+          mergeExternal(rec, row.external);
+          const added = mergeTagsFrom(rec, row);
+          if (added) logRevision(rec, 'EDIT', { tags: 'Modified' });
+          touchRec(rec);
+          saveDB();
+          pushRecEntities(rec);
+          fillFromRec();
+          covers.setSeries(rec.external && rec.external.mangabaka);
+        }).catch(() => {});
+      }
+      if (!r.malId) { ui.setStatus(base); resolveRecPeople(rec).catch(() => {}); return; }
       ui.setStatus(base + ' Fetching characters (MAL)…');
       try {
         const chars = await fetchJikanCharacters(r.malId, rec.type);
@@ -6877,6 +7328,7 @@
           saveDB();
           pushRecEntities(rec);
         }
+        resolveRecPeople(rec).catch(() => {});
         ui.setStatus(base + (chars.length
           ? ` ${chars.length} characters saved. Reload to see them in the Characters section.`
           : ' No characters on MAL.'));
@@ -7484,11 +7936,13 @@
       md.studioName = anime ? (studio.value.trim() || null) : null;
       rec.characters = readChars();
       if (imported) {
-        md.synonyms = imported.synonyms || [];
+        md.title = importTitleObj(imported, md.title.userPreferred);
+        md.synonyms = stripTitleSynonyms(imported.synonyms, md.title);
         if (imported.year && !(md.startDate && md.startDate.year)) {
           md.startDate = { year: imported.year, month: null, day: null };
         }
-        rec.external = Object.assign({}, rec.external, imported.external);
+        mergeExternal(rec, imported.external);
+        importStaff(rec, imported);
       }
     }
 
@@ -7503,7 +7957,7 @@
       imported = r;
       title.value = r.title;
       if (FORMAT_OPTS[type].includes(r.format)) format.value = r.format;
-      mediaStatus.value = r.mediaStatus;
+      if (r.mediaStatus) mediaStatus.value = r.mediaStatus;
       if (anime) {
         if (r.episodes) eps.value = r.episodes;
       } else {
@@ -7517,6 +7971,19 @@
       if (anime && r.studio) studio.value = r.studio;
       covers.setSeries(r.external && r.external.mangabaka);
       const base = `Imported "${r.title}" from ${r.provider}.`;
+      if (r.provider === 'MAL' && r.malId && !(r.external && r.external.mangabaka)) {
+        mbByMalId(r.malId, r.title).then((row) => {
+          if (!row || imported !== r) return;
+          for (const g of row.genres || []) if (!r.genres.includes(g)) r.genres.push(g);
+          for (const t of row.tags || []) if (!r.tags.includes(t)) r.tags.push(t);
+          for (const [k, v] of Object.entries(row.external || {})) {
+            if (v !== null && v !== undefined && (r.external[k] === null || r.external[k] === undefined)) r.external[k] = v;
+          }
+          genres.value = r.genres.join(', ');
+          tags.value = r.tags.join(', ');
+          covers.setSeries(r.external && r.external.mangabaka);
+        }).catch(() => {});
+      }
       if (!r.malId) { ui.setStatus(base); return; }
       ui.setStatus(base + ' Fetching characters (MAL)…');
       try {
@@ -7585,6 +8052,7 @@
                 setBanner(rec.media, bannerUrl, banner.value.trim());
                 applyContent(rec);
                 saveDB();
+                resolveRecPeople(rec).catch(() => {});
                 overlay.remove();
                 syncSections(rec);
                 // Open the native list editor so everything else (score,
@@ -8102,7 +8570,7 @@
           body.append(hint('Reads your MangaBaka library with a personal access token (mangabaka.org → Settings → API, scope library.read). Reading state, progress, rating, dates and notes carry over.'),
             field('Access token', tokIn), skipRow);
         } else {
-          body.append(hint('Header row, any column order. Columns: title (required), type, format, status, progress, progress_volumes, score (in your list\'s format), notes, started_at, completed_at, repeat, private, cover, banner, description, genres, tags, synonyms (; separated), episodes, chapters, volumes, media_status, year, mal_id, mangabaka_id, anilist_id, adult.'),
+          body.append(hint('Header row, any column order. Columns: title (required), type, format, status, progress, progress_volumes, score (in your list\'s format), notes, started_at, completed_at, repeat, private, cover, banner, description, genres, tags, romaji, english, native, synonyms (; separated), episodes, chapters, volumes, media_status, year, mal_id, mangabaka_id, anilist_id, adult.'),
             ta, btnRow(el('button', { onclick: () => fileIn.click() }, 'Choose file…')), field('Type when the CSV has no type column', typeSel), skipRow);
         }
       };
@@ -8283,7 +8751,7 @@
       type: f.type,
       media: {
         id,
-        title: { userPreferred: f.title, romaji: f.title, english: f.title, native: f.title },
+        title: { userPreferred: f.title, romaji: f.title, english: null, native: null },
         coverImage: { extraLarge: f.cover, large: f.cover, medium: f.cover, color: null },
         bannerImage: f.banner,
         coverSource: null,
