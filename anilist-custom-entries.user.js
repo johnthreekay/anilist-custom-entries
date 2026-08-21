@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AniList Custom Entries
 // @namespace    al-custom-entries
-// @version      1.44.4
+// @version      1.45.0
 // @description  Create fully client-side custom anime/manga entries on AniList that behave like normal list entries (rate, note, custom lists, progress, favourite, delete) via the native UI, including local activity feed entries and the home page's in-progress lists. Optionally syncs the database to a private GitHub repo for cross-device use.
 // @author       john
 // @homepageURL  https://github.com/johnthreekay/anilist-custom-entries
@@ -36,7 +36,7 @@
   const window = (typeof unsafeWindow === 'object' && unsafeWindow) ? unsafeWindow : globalThis;
 
   const TAG = '[AL-Custom]';
-  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.44.4'; } catch (e) { /* diagnostics only */ }
+  try { window.__ALCE_T0 = performance.now(); window.__ALCE_VERSION = '1.45.0'; } catch (e) { /* diagnostics only */ }
   const ID_BASE = 2000000000; // far above any real AniList media/entry id, still within GraphQL Int32
   const LS_KEY = 'al-custom-entries-v1';
 
@@ -2124,7 +2124,9 @@
   }
 
   // Apply a SaveMedia mutation's variables (the form's `changes`) locally.
-  function applyMediaEdit(rec, vars) {
+  // extraChanges: revision-log entries for tools-panel fields the Submit
+  // interception already applied (flushPanelPending).
+  function applyMediaEdit(rec, vars, extraChanges) {
     const md = rec.media;
     // The form passes raw input strings; the real API coerces, so do we.
     const toIntOrNull = (v) => {
@@ -2154,7 +2156,7 @@
     if (vars.endDate !== undefined) md.endDate = coerceDate(vars.endDate);
     if (typeof vars.coverImage === 'string' && vars.coverImage) setCover(md, vars.coverImage, vars.coverImage);
     if (typeof vars.bannerImage === 'string') setBanner(md, vars.bannerImage || null, vars.bannerImage);
-    const changes = {};
+    const changes = Object.assign({}, extraChanges);
     for (const [k, v] of Object.entries(vars)) {
       if (['id', 'submissionId', 'submissionSources', 'submissionNotes', 'submissionAssigneeId', 'submissionStatus', 'submissionLocked', 'modNotes'].includes(k)) continue;
       changes[k] = revisionValue(v);
@@ -2341,15 +2343,23 @@
   /* --- studios --- */
   // Two kinds: a typed local studio (rec.media.studioName, anime only) with
   // a stable id derived from its name so entries sharing the name share one
-  // /studio/<id> page, and real AniList studios linked from the edit page's
-  // "Add Studios" (rec.media.studios = [{id (link), studioId, name, isMain}]).
+  // /studio/<id> page, and rec.media.studios = [{id (link), studioId, name,
+  // isMain}]: real AniList studios linked from the edit page's "Add
+  // Studios", plus custom ones added in the tools panel (isCustom: true,
+  // studioId derived from the name like the typed one, re-derived on rename).
+  // Local studios may carry an `image` URL (md.studioImage for the typed
+  // one, link.image for custom links): AniList's Studio type has no image
+  // field, so it decorates the tools panel's list, not site pages.
   function studioIdFor(name) {
     let h = 2166136261;
     const str = String(name || '').trim().toLowerCase();
     for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
     return ID_BASE + 500000000 + (h % 400000000);
   }
-  const localStudioOf = (rec) => (rec.media && rec.media.studioName ? { id: rec.id, studioId: studioIdFor(rec.media.studioName), name: rec.media.studioName, isMain: rec.media.studioMain !== false, isCustom: true } : null);
+  const localStudioOf = (rec) => (rec.media && rec.media.studioName ? {
+    id: rec.id, studioId: studioIdFor(rec.media.studioName), name: rec.media.studioName,
+    isMain: rec.media.studioMain !== false, isCustom: true, image: rec.media.studioImage || null,
+  } : null);
   // Every studio edge of a record, local one first.
   function studiosOf(rec) {
     const out = [];
@@ -2404,7 +2414,7 @@
   }
   function removeStudioLink(rec, linkId) {
     const md = rec.media;
-    if (linkId === rec.id) { md.studioName = null; delete md.studioMain; }
+    if (linkId === rec.id) { md.studioName = null; delete md.studioMain; delete md.studioImage; }
     else md.studios = (md.studios || []).filter((x) => x.id !== linkId);
     logRevision(rec, 'EDIT', { studios: 'Modified' });
     touchRec(rec); saveDB(); pushRecEntities(rec);
@@ -2712,7 +2722,15 @@
     if (hasCustom && query.includes('ToggleFavourite')) return handleFav(vars);
     if (query.includes('SaveMedia(') && (isCustomId(vars.id) || (ctxRec && vars.id === undefined))) {
       const rec = isCustomId(vars.id) ? recById(parseInt(vars.id, 10)) : ctxRec;
-      if (rec) return { SaveMedia: applyMediaEdit(rec, vars) };
+      if (rec) {
+        // Tools-panel fields typed but not yet Saved ride along with
+        // Submit: apply them first and drop the form's copies of those
+        // keys, so the panel's newer value beats a mirror from an earlier
+        // Save while form-only edits still apply untouched.
+        const flushed = flushPanelPending(rec);
+        if (flushed) for (const k of flushed.varKeys) delete vars[k];
+        return { SaveMedia: applyMediaEdit(rec, vars, flushed && flushed.changes) };
+      }
     }
     if (query.includes('SaveAiringSchedule(') && (isCustomId(vars.mediaId) || ctxRec)) {
       return handleSaveAiringSchedule(isCustomId(vars.mediaId) ? recById(parseInt(vars.mediaId, 10)) : ctxRec, vars);
@@ -6276,7 +6294,11 @@
   .alce-btn.primary { background: var(--alce-accent, rgb(61,180,242)); color: #fff; }
   .alce-btn.primary:hover { opacity: .85; }
   .alce-btn.plain { background: transparent; color: rgb(var(--color-text-light, 122 133 143)); }
-  .alce-manage { margin-top: 18px; border-top: 1px solid rgba(255,255,255,.08); padding-top: 14px; }
+  /* Separator borders take the theme's text color (the site vars hold
+     comma-separated triplets, light values on :root, dark overrides on
+     body.site-theme-dark), so they stay visible on light themes where a
+     white-alpha line would vanish. */
+  .alce-manage { margin-top: 18px; border-top: 1px solid rgba(var(--color-text, 159, 173, 189), .15); padding-top: 14px; }
   .alce-manage-title { font-size: 1.4rem; font-weight: 500; color: rgb(var(--color-text, 159 173 189));
     margin-bottom: 8px; }
   .alce-manage-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 1.3rem; }
@@ -6306,6 +6328,11 @@
   /* Labels inside the panel match the native form's (13px/400, 5px gap)
      rather than the list editor's heavier ones. */
   .alce-edit-panel .alce-field label { font-size: 1.3rem; font-weight: 400; margin-bottom: 5px; }
+  /* Panel sections: one bordered group per concern (Details, Images, the
+     linked-data lists), in the native form's section order. Headers get
+     more air than the 8px list-title default so they read as boundaries. */
+  .alce-panel-sec { margin-top: 20px; border-top: 1px solid rgba(var(--color-text, 159, 173, 189), .15); padding-top: 18px; }
+  .alce-panel-sec > .alce-manage-title { margin-bottom: 12px; }
   /* Native-style item rows (modelled on the edit page's character rows):
      cover thumb, title + sub-line, red delete button on the right. */
   .alce-item-row { display: flex; align-items: center; gap: 10px;
@@ -6322,6 +6349,23 @@
     background: rgb(232,93,117); color: #fff; cursor: pointer; opacity: .85; }
   .alce-item-del:hover { opacity: 1; }
   .alce-item-del svg { height: 11px; width: 11px; margin: 0; color: #fff; vertical-align: middle; }
+  .alce-item-edit { width: 26px; height: 26px; border: none; border-radius: 4px; flex-shrink: 0;
+    background: rgb(var(--color-foreground, 21 31 46)); color: rgb(var(--color-text, 159 173 189));
+    cursor: pointer; opacity: .8; }
+  .alce-item-edit:hover { opacity: 1; }
+  .alce-item-edit svg { height: 11px; width: 11px; margin: 0; vertical-align: middle; }
+  /* Inline quick-edit row under a list item (local characters / custom
+     studios); .alce-char-row supplies the compact input/select styling. */
+  .alce-item-editor { margin: -2px 0 8px; }
+  .alce-item-editor .save { background: var(--alce-accent, rgb(61,180,242)); color: #fff; border: none;
+    border-radius: 4px; height: 34px; padding: 0 14px; font-size: 1.3rem; cursor: pointer; flex-shrink: 0; }
+  .alce-item-editor .save:hover { opacity: .85; }
+  .alce-item-editor .cancel { background: rgb(var(--color-background, 11 22 34));
+    color: rgb(var(--color-text, 159 173 189)); border: none; border-radius: 4px; height: 34px;
+    padding: 0 12px; font-size: 1.3rem; cursor: pointer; flex-shrink: 0; }
+  .alce-item-editor label.main { display: flex; gap: 6px; align-items: center; font-size: 1.2rem;
+    color: rgb(var(--color-text-light, 122 133 143)); cursor: pointer; white-space: nowrap; flex-shrink: 0; }
+  .alce-item-editor label.main input { height: 14px; width: 14px; padding: 0; }
   button.alce-danger { background: rgb(232,93,117); color: #fff; border: none; border-radius: 4px;
     padding: 0 16px; height: 36px; font-size: 1.3rem; cursor: pointer; }
   button.alce-danger:hover { opacity: .9; color: #fff; }
@@ -6341,9 +6385,9 @@
     background: rgb(var(--color-background, 11 22 34)); color: rgb(var(--color-text, 159 173 189));
     padding: 8px 10px; font-size: 1.2rem; margin-top: 10px; display: none; }
   .alce-io .alce-io-btns { display: flex; gap: 10px; }
-  .alce-move { margin-top: 16px; border-top: 1px solid rgba(255,255,255,.08); padding-top: 14px; }
+  .alce-move { margin-top: 16px; border-top: 1px solid rgba(var(--color-text, 159, 173, 189), .15); padding-top: 14px; }
   .alce-move .alce-io-btns { display: flex; gap: 10px; }
-  .alce-sync { margin-top: 16px; border-top: 1px solid rgba(255,255,255,.08); padding-top: 14px; }
+  .alce-sync { margin-top: 16px; border-top: 1px solid rgba(var(--color-text, 159, 173, 189), .15); padding-top: 14px; }
   .alce-sync .alce-io-btns { display: flex; gap: 10px; }
   .alce-sync-status { font-size: 1.2rem; margin: 6px 0 10px; color: rgb(var(--color-text-light, 122 133 143)); }
   .alce-check { display: flex; gap: 10px; align-items: flex-start; font-size: 1.3rem; cursor: pointer; margin: 8px 0 4px;
@@ -7146,6 +7190,16 @@
     COMPILATION: 'Compilation', CONTAINS: 'Contains', SAME_UNIVERSE: 'Same Universe',
   };
 
+  // Tools-panel edits typed but not yet Saved: registered by buildEditPanel
+  // and applied when the native form's Submit (SaveMedia) fires, so Submit
+  // saves the panel too, not just the native form's own fields.
+  let panelPending = null;
+  function flushPanelPending(rec) {
+    const p = panelPending;
+    if (!p || p.recId !== rec.id || !p.root.isConnected) return null;
+    try { return p.flush(); } catch (e) { console.warn(TAG, 'panel flush failed', e); return null; }
+  }
+
   function buildEditPanel(rec) {
     const anime = rec.type === 'ANIME';
     const md = rec.media;
@@ -7168,6 +7222,11 @@
     // URL field instead and keep the stored image unless a new URL is typed.
     const EMBEDDED = '[embedded image, paste a URL to replace]';
     const showImg = (u) => (isDataUrl(u) ? EMBEDDED : (u || ''));
+    // Fields edited since the last fill/Save. The native form's Submit
+    // flushes exactly these (flushDirty), so a panel edit doesn't need the
+    // Save button first, while a field the panel didn't touch can never
+    // overwrite a form-side edit with its stale copy.
+    const dirty = new Set();
     const fillFromRec = () => {
       title.value = md.title.userPreferred || '';
       format.value = md.format || (anime ? 'TV' : 'MANGA');
@@ -7182,8 +7241,32 @@
       genres.value = (md.genres || []).join(', ');
       tagsIn.value = (md.tags || []).map((t) => `${t.name}:${t.rank}`).join(', ');
       studioIn.value = md.studioName || '';
+      dirty.clear();
     };
     fillFromRec();
+    const watch = (input, key) => { for (const ev of ['input', 'change']) input.addEventListener(ev, () => dirty.add(key)); };
+    watch(title, 'title'); watch(format, 'format'); watch(mediaStatus, 'status');
+    watch(eps, 'count'); watch(vols, 'volumes'); watch(cover, 'cover'); watch(banner, 'banner');
+    watch(description, 'description'); watch(genres, 'genres'); watch(tagsIn, 'tags'); watch(studioIn, 'studio');
+
+    // Quick edit's single field shows userPreferred, so typing edits the
+    // title in the viewer's title language (per-language fine-tuning
+    // lives in the native form below). Fields that merely mirrored the
+    // old display title (pre-1.42 imports flattened all four) collapse.
+    const applyTitleField = () => {
+      const t = title.value.trim() || md.title.userPreferred;
+      const oldT = md.title;
+      const nt = {
+        romaji: !oldT.romaji || oldT.romaji === oldT.userPreferred ? null : oldT.romaji,
+        english: !oldT.english || oldT.english === oldT.userPreferred ? null : oldT.english,
+        native: !oldT.native || oldT.native === oldT.userPreferred ? null : oldT.native,
+      };
+      const lang = viewerTitleLang();
+      nt[lang === 'ENGLISH' ? 'english' : (lang === 'NATIVE' ? 'native' : 'romaji')] = t;
+      if (!nt.romaji && !nt.english && !nt.native) nt.romaji = t;
+      nt.userPreferred = preferredTitleOf(nt);
+      md.title = nt;
+    };
 
     const saveQuick = async (e) => {
       const btn = e && e.currentTarget;
@@ -7196,22 +7279,7 @@
           cv === EMBEDDED ? md.coverImage.large : embedIfHotlinkBlocked(cv || DEFAULT_COVER, 'cover'),
           bv === EMBEDDED ? md.bannerImage : embedIfHotlinkBlocked(bv || null, 'banner'),
         ]);
-        const t = title.value.trim() || md.title.userPreferred;
-        // Quick edit's single field shows userPreferred, so typing edits the
-        // title in the viewer's title language (per-language fine-tuning
-        // lives in the native form below). Fields that merely mirrored the
-        // old display title (pre-1.42 imports flattened all four) collapse.
-        const oldT = md.title;
-        const nt = {
-          romaji: !oldT.romaji || oldT.romaji === oldT.userPreferred ? null : oldT.romaji,
-          english: !oldT.english || oldT.english === oldT.userPreferred ? null : oldT.english,
-          native: !oldT.native || oldT.native === oldT.userPreferred ? null : oldT.native,
-        };
-        const lang = viewerTitleLang();
-        nt[lang === 'ENGLISH' ? 'english' : (lang === 'NATIVE' ? 'native' : 'romaji')] = t;
-        if (!nt.romaji && !nt.english && !nt.native) nt.romaji = t;
-        nt.userPreferred = preferredTitleOf(nt);
-        md.title = nt;
+        applyTitleField();
         md.format = format.value;
         md.status = mediaStatus.value;
         if (anime) md.episodes = intOrNull(eps.value);
@@ -7236,6 +7304,43 @@
       }
     };
 
+    // Apply the fields typed since the last fill/Save straight onto the
+    // record - dirty ones only. Runs synchronously inside the SaveMedia
+    // interception (flushPanelPending) right before applyMediaEdit, whose
+    // embedRecImages then embeds/uploads a raw cover/banner URL, saves and
+    // re-renders. Returns { varKeys, changes }: the SaveMedia variable keys
+    // now owned by the panel and their revision-log entries.
+    const flushDirty = () => {
+      if (!dirty.size) return null;
+      const varKeys = [];
+      const changes = {};
+      if (dirty.has('title')) { applyTitleField(); varKeys.push('title'); changes.title = revisionValue(md.title.userPreferred); }
+      if (dirty.has('format')) { md.format = format.value; varKeys.push('format'); changes.format = revisionValue(md.format); }
+      if (dirty.has('status')) { md.status = mediaStatus.value; varKeys.push('status'); changes.status = revisionValue(md.status); }
+      if (dirty.has('count')) {
+        if (anime) md.episodes = intOrNull(eps.value); else md.chapters = intOrNull(eps.value);
+        const k = anime ? 'episodes' : 'chapters';
+        varKeys.push(k); changes[k] = 'Modified';
+      }
+      if (dirty.has('volumes') && !anime) { md.volumes = intOrNull(vols.value); varKeys.push('volumes'); changes.volumes = 'Modified'; }
+      const cv = cover.value.trim();
+      if (dirty.has('cover') && cv !== EMBEDDED) {
+        setCover(md, cv || DEFAULT_COVER, cv || null);
+        varKeys.push('coverImage'); changes.coverImage = 'Modified';
+      }
+      const bv = banner.value.trim();
+      if (dirty.has('banner') && bv !== EMBEDDED) {
+        setBanner(md, bv || null, bv || null);
+        varKeys.push('bannerImage'); changes.bannerImage = 'Modified';
+      }
+      if (dirty.has('description')) { md.description = description.value.trim() || null; varKeys.push('description'); changes.description = 'Modified'; }
+      if (dirty.has('genres')) { md.genres = genres.value.split(',').map((s) => s.trim()).filter(Boolean); varKeys.push('genres'); changes.genres = 'Modified'; }
+      if (dirty.has('tags')) { md.tags = parseTags(tagsIn.value); changes.tags = 'Modified'; }
+      if (dirty.has('studio') && anime) { md.studioName = studioIn.value.trim() || null; changes.studio = 'Modified'; }
+      fillFromRec(); // re-render the saved state; also clears `dirty`
+      return { varKeys, changes };
+    };
+
     // "Embed" next to the image fields: force-embed the URL in the field
     // (even from hosts that hotlink fine), or, when the field is empty /
     // shows the embedded marker, re-embed from the remembered source URL -
@@ -7252,7 +7357,9 @@
       if (btn) { btn.disabled = true; btn.textContent = imgHostConfigured() ? 'Uploading…' : 'Embedding…'; }
       try {
         const data = await embedImage(source, kind, { force: true });
-        if (!isDataUrl(data)) return; // failure already toasted
+        // Success is a data: URI or, with an image host configured, a URL on
+        // that host; failure hands the input back unchanged (already toasted).
+        if (!isDataUrl(data) && !onImageHost(data)) return;
         if (kind === 'cover') setCover(md, data, source); else setBanner(md, data, source);
         touchRec(rec);
         saveDB();
@@ -7383,22 +7490,26 @@
       toast(`Airing schedule saved: ${count} episode${count === 1 ? '' : 's'}`);
     };
     if (anime) renderSched();
+    // A titled, bordered panel section (Details, Images, Airing Schedule,
+    // the linked-data lists).
+    const sec = (label, ...kids) => el('div', { class: 'alce-panel-sec' },
+      el('div', { class: 'alce-manage-title' }, label), ...kids);
     const schedBlock = anime ? [
-      el('div', { class: 'alce-manage-title', style: 'margin-top: 16px' }, 'Airing Schedule'),
-      schedList,
-      el('div', { class: 'alce-row' },
-        field('First episode airs', schedAt),
-        field('Every (days)', schedEvery),
-        field('Episodes', schedCount),
-        field('Starting at episode', schedStart)),
-      el('div', { class: 'alce-panel-btns' },
-        el('button', { class: 'blue', onclick: generateSched }, 'Generate'),
-        el('button', { onclick: () => { if (!airingScheduleOf(rec).length) return; handleSaveAiringSchedule(rec, { airingSchedule: [] }); renderSched(); toast('Airing schedule cleared'); } }, 'Clear'),
-      ),
+      sec('Airing Schedule',
+        schedList,
+        el('div', { class: 'alce-row' },
+          field('First episode airs', schedAt),
+          field('Every (days)', schedEvery),
+          field('Episodes', schedCount),
+          field('Starting at episode', schedStart)),
+        el('div', { class: 'alce-panel-btns' },
+          el('button', { class: 'blue', onclick: generateSched }, 'Generate'),
+          el('button', { onclick: () => { if (!airingScheduleOf(rec).length) return; handleSaveAiringSchedule(rec, { airingSchedule: [] }); renderSched(); toast('Airing schedule cleared'); } }, 'Clear'),
+        )),
     ] : [];
 
     // --- recommendations manager ---
-    const itemRow = (media, fallbackName, sub, onRemove) => {
+    const itemRow = (media, fallbackName, sub, onRemove, onEdit) => {
       const cover = el('div', { class: 'alce-item-cover' });
       const cu = media && media.coverImage && (media.coverImage.medium || media.coverImage.large);
       if (cu && cu !== DEFAULT_COVER) cover.style.backgroundImage = 'url("' + String(cu).replace(/"/g, '') + '")';
@@ -7407,6 +7518,7 @@
         el('div', { class: 'alce-item-text' },
           el('div', { class: 'alce-item-title' }, (media && media.title && media.title.userPreferred) || fallbackName),
           el('div', { class: 'alce-item-sub' }, sub)),
+        ...(onEdit ? [el('button', { class: 'alce-item-edit', title: 'Quick edit', onclick: onEdit }, svgIcon(ICON_PEN))] : []),
         el('button', { class: 'alce-item-del', title: 'Remove', onclick: onRemove }, svgIcon(ICON_TRASH)),
       );
     };
@@ -7518,7 +7630,10 @@
       }
       if (!(rec.relations || []).length) {
         relList.appendChild(el('div', { class: 'alce-sync-status' },
-          'None yet. Add Relation in the form\'s Relations section below (Submit to save), or Fetch From MangaBaka, which links sequels/prequels/side stories: to another custom entry when one matches, to the real AniList entry when it exists, and otherwise creates a custom entry from the MangaBaka data.'));
+          'None yet. Add Relation in the form\'s Relations section below (Submit to save)'
+          + (rec.external && rec.external.mangabaka
+            ? ', or Fetch From MangaBaka, which links sequels/prequels/side stories: to another custom entry when one matches, to the real AniList entry when it exists, and otherwise creates a custom entry from the MangaBaka data.'
+            : '.')));
       }
     };
     renderRels();
@@ -7532,7 +7647,7 @@
       for (const st of rec.staff || []) {
         const name = staffNameOf(st).userPreferred;
         staffList.appendChild(itemRow(
-          { title: { userPreferred: name }, coverImage: { medium: st.image || null } },
+          { title: { userPreferred: name }, coverImage: { medium: st.image || DEFAULT_STAFF_IMG } },
           name,
           (st.role || 'No role') + (st.isCustom ? ' · Local staff' : ' · AniList staff'),
           () => {
@@ -7552,13 +7667,44 @@
     renderStaff();
 
     const charList = el('div');
+    // Inline quick edit (name / role / image) for local characters; real
+    // AniList characters keep their served name and image, so only the
+    // native form's role control applies to them.
+    let editingChar = null; // character id whose editor row is open
+    const charEditor = (c) => {
+      const nameIn = el('input', { class: 'c-name', type: 'text', placeholder: 'Name', value: c.name || '' });
+      const roleSel = select([['MAIN', 'Main'], ['SUPPORTING', 'Supporting'], ['BACKGROUND', 'Background']], c.role || 'MAIN');
+      roleSel.className = 'c-role';
+      const imgIn = el('input', { class: 'c-img', type: 'text', placeholder: 'Image URL', value: c.image || '' });
+      const close = () => { editingChar = null; renderChars(); };
+      const save = () => {
+        const name = nameIn.value.trim();
+        // A rename invalidates the stored Given/Surname parts from the
+        // native character form; charPartsOf renders from c.name alone.
+        if (name && name !== c.name) { c.name = name; c.first = null; c.middle = null; c.last = null; }
+        c.role = roleSel.value;
+        c.image = imgIn.value.trim() || null;
+        logRevision(rec, 'EDIT', { characters: 'Modified' });
+        touchRec(rec);
+        saveDB();
+        pushRecEntities(rec);
+        close();
+      };
+      const row = el('div', { class: 'alce-item-editor alce-char-row' },
+        nameIn, roleSel, imgIn,
+        el('button', { class: 'save', onclick: save }, 'Save'),
+        el('button', { class: 'cancel', onclick: close }, 'Cancel'));
+      row.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); save(); } });
+      return row;
+    };
     const renderChars = () => {
       charList.textContent = '';
       for (const c of rec.characters || []) {
+        const local = isCustomId(c.id);
         charList.appendChild(itemRow(
-          { title: { userPreferred: c.name || 'Unnamed' }, coverImage: { medium: c.image || null } },
+          { title: { userPreferred: c.name || 'Unnamed' }, coverImage: { medium: c.image || DEFAULT_CHAR_IMG } },
           c.name || 'Unnamed',
-          (c.role || 'MAIN') + (isCustomId(c.id) ? ' · Local character' : ' · AniList character'),
+          (c.role || 'MAIN') + (local ? ' · Local character' : ' · AniList character'),
           () => {
             rec.characters = (rec.characters || []).filter((x) => x !== c);
             logRevision(rec, 'EDIT', { characters: 'Modified' });
@@ -7567,7 +7713,9 @@
             pushRecEntities(rec);
             renderChars();
           },
+          local ? () => { editingChar = editingChar === c.id ? null : c.id; renderChars(); } : null,
         ));
+        if (local && editingChar === c.id) charList.appendChild(charEditor(c));
       }
       if (!(rec.characters || []).length) {
         charList.appendChild(el('div', { class: 'alce-sync-status' },
@@ -7577,19 +7725,104 @@
     renderChars();
 
     const studioList = el('div');
+    // Inline quick edit (rename / main flag) for local studios: the typed
+    // one (md.studioName, link id = rec.id) and panel-added custom links.
+    // Real AniList studios keep their served name (main flag lives in the
+    // native form), so they get no editor.
+    let editingStudio = null; // studio link id whose editor row is open
+    const studioEditor = (st) => {
+      const nameIn = el('input', { class: 'c-name', type: 'text', placeholder: 'Studio name', value: st.name || '' });
+      const imgIn = el('input', { class: 'c-img', type: 'text', placeholder: 'Image URL (optional)', value: st.image || '' });
+      const mainIn = el('input', { type: 'checkbox' });
+      mainIn.checked = !!st.isMain;
+      const close = () => { editingStudio = null; renderStudios(); fillFromRec(); };
+      const save = () => {
+        const name = nameIn.value.trim();
+        if (!name) { toast('Studio name cannot be empty', true); return; }
+        const img = imgIn.value.trim() || null;
+        if (st.id === rec.id) {
+          md.studioName = name;
+          md.studioMain = mainIn.checked;
+          if (img) md.studioImage = img; else delete md.studioImage;
+        } else {
+          const link = (md.studios || []).find((x) => x.id === st.id);
+          if (link) {
+            link.name = name;
+            // Custom studio ids derive from the name (entries sharing the
+            // name share one /studio/<id> page), so a rename re-keys it.
+            if (link.isCustom) link.studioId = studioIdFor(name);
+            link.isMain = mainIn.checked;
+            link.image = img;
+          }
+        }
+        logRevision(rec, 'EDIT', { studios: 'Modified' });
+        touchRec(rec);
+        saveDB();
+        pushRecEntities(rec);
+        close();
+      };
+      const row = el('div', { class: 'alce-item-editor alce-char-row' },
+        nameIn, imgIn,
+        el('label', { class: 'main' }, mainIn, 'Main studio'),
+        el('button', { class: 'save', onclick: save }, 'Save'),
+        el('button', { class: 'cancel', onclick: close }, 'Cancel'));
+      row.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target !== mainIn) { e.preventDefault(); save(); } });
+      return row;
+    };
     const renderStudios = () => {
       studioList.textContent = '';
       for (const st of studiosOf(rec)) {
-        studioList.appendChild(itemRow(null, st.name || 'Studio #' + st.studioId,
+        studioList.appendChild(itemRow(
+          { title: { userPreferred: st.name }, coverImage: { medium: st.image || DEFAULT_STAFF_IMG } },
+          st.name || 'Studio #' + st.studioId,
           (st.isMain ? 'Main studio' : 'Studio') + (st.isCustom ? ' · Local studio' : ' · AniList studio'),
-          () => { removeStudioLink(rec, st.id); renderStudios(); fillFromRec(); }));
+          () => { removeStudioLink(rec, st.id); renderStudios(); fillFromRec(); },
+          st.isCustom ? () => { editingStudio = editingStudio === st.id ? null : st.id; renderStudios(); } : null));
+        if (st.isCustom && editingStudio === st.id) studioList.appendChild(studioEditor(st));
       }
       if (!studiosOf(rec).length) {
         studioList.appendChild(el('div', { class: 'alce-sync-status' },
-          'None yet. Type a studio in the Studio field above, or use Add Studios in the form\'s Studios section below, then Submit.'));
+          'None yet. Add a custom studio below, or link real AniList studios with Add Studios in the form\'s Studios section (then Submit).'));
       }
     };
     renderStudios();
+    // Adding by name: the first custom studio takes the Details field's
+    // slot (md.studioName, main by default); further ones become custom
+    // links in md.studios. The form's own Add Studios stays the way to
+    // link real AniList studios.
+    const studioAddIn = el('input', { class: 'c-name', type: 'text', placeholder: 'Studio name' });
+    const studioAddImg = el('input', { class: 'c-img', type: 'text', placeholder: 'Image URL (optional)' });
+    const addStudio = () => {
+      const name = studioAddIn.value.trim();
+      if (!name) return;
+      if (studiosOf(rec).some((st) => (st.name || '').toLowerCase() === name.toLowerCase())) {
+        toast('That studio is already listed', true);
+        return;
+      }
+      const img = studioAddImg.value.trim() || null;
+      if (!md.studioName) {
+        md.studioName = name;
+        if (img) md.studioImage = img;
+      } else {
+        md.studios = md.studios || [];
+        db.seq += 1;
+        md.studios.push({ id: ID_BASE + db.seq, studioId: studioIdFor(name), name, isMain: !studiosOf(rec).some((st) => st.isMain), isCustom: true, image: img });
+      }
+      logRevision(rec, 'EDIT', { studios: 'Modified' });
+      touchRec(rec);
+      saveDB();
+      pushRecEntities(rec);
+      studioAddIn.value = '';
+      studioAddImg.value = '';
+      renderStudios();
+      fillFromRec();
+    };
+    for (const input of [studioAddIn, studioAddImg]) {
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addStudio(); } });
+    }
+    const studioAddRow = el('div', { class: 'alce-item-editor alce-char-row' },
+      studioAddIn, studioAddImg,
+      el('button', { class: 'save', onclick: addStudio }, 'Add Custom Studio'));
 
     const linkList = el('div');
     const renderLinks = () => {
@@ -7764,42 +7997,49 @@
       }
     };
 
-    return el('div', { class: 'alce-edit-panel' },
+    // Import search on top (applies immediately), then what the Save button
+    // (or the native Submit) saves - text Details, then Images - and below
+    // that the immediate-save groups in the native form's section order
+    // (Airing Data, Characters, Staff, Studios, Relations, External Links),
+    // so each list sits in the same order as the form section it manages.
+    // Recommendations (no form section; managed from the entry page) close.
+    const root = el('div', { class: 'alce-edit-panel' },
       el('h2', {}, 'Custom Entry Tools'),
       el('div', { class: 'alce-edit-panel-card' },
         search.root,
-        field('Title', title),
-        el('div', { class: 'alce-row' },
-          field('Format', format),
-          field('Release Status', mediaStatus),
-          field(anime ? 'Episodes' : 'Chapters', eps),
-          ...(anime ? [] : [field('Volumes', vols)])),
-        imgField('Cover Image URL', cover, 'cover'),
-        covers.root,
-        imgField('Banner Image URL', banner, 'banner'),
-        field('Description', description),
-        el('div', { class: 'alce-row' },
-          field('Genres', genres),
-          field('Tags (name:rank)', tagsIn),
-          ...(anime ? [field('Studio', studioIn)] : [])),
+        sec('Details',
+          field('Title', title),
+          el('div', { class: 'alce-row' },
+            field('Format', format),
+            field('Release Status', mediaStatus),
+            field(anime ? 'Episodes' : 'Chapters', eps),
+            ...(anime ? [] : [field('Volumes', vols)])),
+          field('Description', description),
+          el('div', { class: 'alce-row' },
+            field('Genres', genres),
+            field('Tags (name:rank)', tagsIn),
+            ...(anime ? [field('Studio', studioIn)] : []))),
+        sec('Images',
+          imgField('Cover Image URL', cover, 'cover'),
+          covers.root,
+          imgField('Banner Image URL', banner, 'banner')),
         el('div', { class: 'alce-panel-btns' },
-          el('button', { class: 'blue', onclick: saveQuick }, 'Save'),
+          el('button', { class: 'blue', title: 'Saves Details and Images (pressing the form\'s Submit also saves them)', onclick: saveQuick }, 'Save'),
         ),
         ...schedBlock,
-        el('div', { class: 'alce-manage-title', style: 'margin-top: 16px' }, 'Recommendations'),
-        recList,
-        ...(rec.external && rec.external.mangabaka ? [el('div', { class: 'alce-panel-btns' }, recsBtn)] : []),
-        el('div', { class: 'alce-manage-title', style: 'margin-top: 16px' }, 'Relations'),
-        relList,
-        ...(rec.external && rec.external.mangabaka ? [el('div', { class: 'alce-panel-btns' }, relsBtn)] : []),
-        el('div', { class: 'alce-manage-title', style: 'margin-top: 16px' }, 'Characters'),
-        charList,
-        el('div', { class: 'alce-manage-title', style: 'margin-top: 16px' }, 'Staff'),
-        staffList,
-        ...(anime ? [el('div', { class: 'alce-manage-title', style: 'margin-top: 16px' }, 'Studios'), studioList] : []),
-        el('div', { class: 'alce-manage-title', style: 'margin-top: 16px' }, 'External Links'),
-        linkList,
+        sec('Characters', charList),
+        sec('Staff', staffList),
+        ...(anime ? [sec('Studios', studioList, studioAddRow)] : []),
+        sec('Relations',
+          relList,
+          ...(rec.external && rec.external.mangabaka ? [el('div', { class: 'alce-panel-btns' }, relsBtn)] : [])),
+        sec('External Links', linkList),
+        sec('Recommendations',
+          recList,
+          ...(rec.external && rec.external.mangabaka ? [el('div', { class: 'alce-panel-btns' }, recsBtn)] : [])),
       ));
+    panelPending = { recId: rec.id, root, flush: flushDirty };
+    return root;
   }
 
   // Keep the tools panel mounted above the native submission form while a
